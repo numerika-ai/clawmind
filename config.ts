@@ -20,6 +20,7 @@ export const ENTRY_TYPES = [
   "history",
   "tool",
   "result",
+  "task",
 ] as const;
 export type EntryType = (typeof ENTRY_TYPES)[number];
 

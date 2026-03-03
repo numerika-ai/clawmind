@@ -467,7 +467,7 @@ class UnifiedDB {
       sql = `
 CREATE TABLE IF NOT EXISTS unified_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_type TEXT CHECK(entry_type IN ('skill','protocol','config','history','tool','result')) NOT NULL,
+    entry_type TEXT CHECK(entry_type IN ('skill','protocol','config','history','tool','result','task')) NOT NULL,
     tags TEXT, content TEXT NOT NULL, summary TEXT, source_path TEXT,
     hnsw_key TEXT, skill_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

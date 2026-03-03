@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 -- NEW: Unified memory entries (bridging USMD <-> HNSW)
 CREATE TABLE IF NOT EXISTS unified_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_type TEXT CHECK(entry_type IN ('skill','protocol','config','history','tool','result')) NOT NULL,
+    entry_type TEXT CHECK(entry_type IN ('skill','protocol','config','history','tool','result','task')) NOT NULL,
     tags TEXT,
     content TEXT NOT NULL,
     summary TEXT,

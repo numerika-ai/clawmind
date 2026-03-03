@@ -1468,7 +1468,7 @@ const memoryUnifiedPlugin = {
       description: "Search across USMD skills and HNSW vector memory. Combines structured SQL + semantic search.",
       parameters: Type.Object({
         query: Type.String({ description: "Search query" }),
-        type: Type.Optional(Type.String({ description: "Filter by entry type: skill/protocol/config/history/tool/result" })),
+        type: Type.Optional(Type.String({ description: "Filter by entry type: skill/protocol/config/history/tool/result/task" })),
         limit: Type.Optional(Type.Number({ description: "Max results (default: 10)" })),
       }),
       async execute(_id, params) {
@@ -1507,7 +1507,7 @@ const memoryUnifiedPlugin = {
       description: "Store an entry in both USMD SQLite and Ruflo HNSW. Auto-tags and summarizes.",
       parameters: Type.Object({
         content: Type.String({ description: "Content to store" }),
-        type: Type.Optional(Type.String({ description: "Entry type: skill/protocol/config/history/tool/result (default: history)" })),
+        type: Type.Optional(Type.String({ description: "Entry type: skill/protocol/config/history/tool/result/task (default: history)" })),
         tags: Type.Optional(Type.String({ description: "Comma-separated tags" })),
         source_path: Type.Optional(Type.String({ description: "Source file path" })),
       }),

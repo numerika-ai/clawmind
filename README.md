@@ -1,6 +1,6 @@
 # memory-unified — OpenClaw Plugin
 
-Unified memory layer for [OpenClaw](https://github.com/openclaw/openclaw) that merges **USMD SQLite** skill database with **Ruflo HNSW** vector search. Gives your AI agent structured + semantic long-term memory.
+Unified memory layer for [OpenClaw](https://github.com/openclaw/openclaw) that merges **USMD SQLite** skill database with **HNSW** vector search. Gives your AI agent structured + semantic long-term memory with task tracking.
 
 ## Features
 
@@ -10,48 +10,79 @@ Unified memory layer for [OpenClaw](https://github.com/openclaw/openclaw) that m
 - **Semantic search:** Qwen3-Embedding 4096-dim vectors via native `hnswlib-node` (no external vector DB needed)
 - **Unified search tool:** `unified_search` queries both SQL + HNSW simultaneously, merges and ranks results
 
+### Entry Types
+| Type | Purpose | Example |
+|------|---------|---------|
+| `skill` | Learned procedures, SKILL.md files | "How to deploy via Docker" |
+| `protocol` | Reusable workflows, SOPs | "Subagent spawn protocol" |
+| `config` | Infrastructure, architecture, settings | "Server IPs, Docker ports" |
+| `history` | General facts, conversation logs | "User prefers dark mode" |
+| `tool` | Tool usage patterns, results | "ffmpeg conversion flags" |
+| `result` | Task outputs, deliverables | "Training run metrics" |
+| `task` | Work items with status tracking | "Hardware scan — IN_PROGRESS" |
+
+### Task Tracking
+- **Active work:** `unified_store(type="task", tags="active,...")` — what the agent is working on now
+- **Completed:** `unified_store(type="task", tags="done,...")` — finished items
+- **Blocked:** `unified_store(type="task", tags="blocked,...")` — waiting on something
+- **Query tasks:** `unified_search(type="task")` — find all tracked work items
+- Tasks are indexed in both SQLite (structured query) and HNSW (semantic search)
+
 ### RAG (Retrieval-Augmented Generation)
-- **RAG slim on agent start:** before each agent session, searches memory for context relevant to the user's message
-- **Skill procedure injection:** matched skill procedures are injected into context (the `[SKILL MATCH]` blocks you see)
-- **HNSW result injection:** top-K semantic matches from vector memory, with similarity scores
-- **Conversation thread tracking:** recent active threads summarized and injected for continuity
+- **RAG slim on agent start:** searches memory for context relevant to the user's message
+- **Skill procedure injection:** matched skill procedures injected into context (`[SKILL MATCH]` blocks)
+- **HNSW semantic injection:** top-K vector matches with similarity scores
+- **Active thread injection:** recent conversation threads summarized for continuity
+- **Task context:** active tasks surfaced in RAG results
 
 ### Skill Learning
-- **Skill execution tracking:** logs every skill use with timing, token count, success/failure status
-- **Pattern recognition:** detects recurring patterns across skill executions with confidence scoring
-- **Pattern decay:** confidence degrades over time (configurable decay rate) — stale patterns fade out
-- **Procedure proposals:** the system can propose improved procedures based on execution history
+- **Skill execution tracking:** logs every skill use with timing, token count, success/failure
+- **Pattern recognition:** detects recurring patterns with confidence scoring
+- **Pattern decay:** confidence degrades over time — stale patterns fade out
+- **Procedure proposals:** proposes improved procedures based on execution history
 
 ### Conversation Memory
-- **Conversation threads:** groups related messages into threads with topics, tags, and status
-- **Thread lifecycle:** active → resolved → archived — queryable via `unified_conversations` tool
-- **Cross-session continuity:** conversations persist across agent restarts and session rotations
+- **Conversation threads:** groups messages into threads with topics, tags, status
+- **Thread lifecycle:** active → resolved → archived — queryable via `unified_conversations`
+- **Cross-session continuity:** conversations persist across restarts and session rotations
 
 ### Agent Hooks
-- **`before_agent_start`** — RAG slim injection (skills + HNSW + threads + patterns)
-- **`after_tool_call`** — logs tool invocations to HNSW with auto-generated tags
-- **`agent_end`** — closes SONA trajectory with success/failure label for self-learning
+| Hook | Trigger | Action |
+|------|---------|--------|
+| `before_agent_start` | New message arrives | RAG slim: injects skills + HNSW + threads + patterns into context |
+| `after_tool_call` | Any tool completes | Logs tool name, params, result to HNSW with auto-tags |
+| `agent_end` | Session ends | Closes SONA trajectory with success/failure label |
 
 ### Trajectory Tracking (SONA)
 - **Start/step/end lifecycle:** each agent session is a trajectory with quality-scored steps
 - **Self-learning signal:** success/failure labels feed back into skill confidence and pattern updates
-- **Ruflo MCP bridge:** optional integration with external Ruflo MCP server for advanced trajectory analysis
+- **Ruflo MCP bridge:** optional integration with external Ruflo server for advanced analysis
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    memory-unified plugin                     │
-├─────────────────────┬───────────────────────────────────────┤
-│   USMD SQLite       │          Ruflo HNSW                   │
-│   (structured)      │          (semantic)                   │
-│                     │                                       │
-│ • skills table      │ • ruflo_memory_store (ns: unified)    │
-│ • skill_executions  │ • ruflo_memory_search (vector sim)    │
-│ • unified_entries   │ • trajectory tracking (SONA)          │
-│ • tool_calls        │                                       │
-│ • artifacts         │                                       │
-└─────────────────────┴───────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                      memory-unified plugin                           │
+├───────────────────────────┬──────────────────────────────────────────┤
+│     USMD SQLite           │         Native HNSW (hnswlib-node)      │
+│     (structured)          │         (semantic, 4096-dim)             │
+│                           │                                          │
+│ • skills                  │ • Qwen3-Embedding vectors                │
+│ • skill_executions        │ • cosine similarity search               │
+│ • unified_entries         │ • auto-embed on store                    │
+│   (type: skill/protocol/  │ • 50K max elements                      │
+│    config/history/tool/   │ • M=16, efConstruction=200               │
+│    result/task)           │                                          │
+│ • tool_calls              │                                          │
+│ • patterns                ├──────────────────────────────────────────┤
+│ • conversations           │         Ruflo MCP (optional)             │
+│ • artifacts               │ • trajectory tracking                    │
+│ • procedure_proposals     │ • external vector store                  │
+└───────────────────────────┴──────────────────────────────────────────┘
+         │                              │
+         ▼                              ▼
+   FTS5 full-text              Ollama embeddings
+   keyword search              (qwen3-embedding:8b)
 ```
 
 ## Installation
@@ -183,34 +214,91 @@ Set in OpenClaw's env config for persistence:
 
 ## Tools
 
-The plugin exposes these tools to your AI agent:
+### `unified_search`
 
-| Tool | Description |
-|------|-------------|
-| `unified_search` | Search across USMD + HNSW (structured + semantic). Supports filtering by entry type |
-| `unified_store` | Store entry to both backends with auto-tagging and summarization |
-| `unified_conversations` | List and search conversation threads |
+Search across USMD skills and HNSW vector memory. Combines structured SQL + semantic search.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | ✅ | Search query |
+| `type` | string | ❌ | Filter by entry type: `skill` / `protocol` / `config` / `history` / `tool` / `result` / `task` |
+| `limit` | number | ❌ | Max results (default: 10) |
+
+**Examples:**
+```
+unified_search(query="Docker containers on Tank")
+unified_search(query="active work", type="task")
+unified_search(query="training baseline", type="config", limit=5)
+```
+
+### `unified_store`
+
+Store an entry in both USMD SQLite and HNSW. Auto-tags and summarizes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `content` | string | ✅ | Content to store |
+| `type` | string | ❌ | Entry type: `skill` / `protocol` / `config` / `history` / `tool` / `result` / `task` (default: `history`) |
+| `tags` | string | ❌ | Comma-separated tags |
+| `source_path` | string | ❌ | Source file path |
+
+**Examples:**
+```
+# Store a skill
+unified_store(content="How to restart collectors...", type="skill", tags="collectors,spark")
+
+# Track a task
+unified_store(content="Hardware scan — IN_PROGRESS", type="task", tags="active,infrastructure")
+
+# Store infrastructure config
+unified_store(content="Tank IP: 192.168.1.100, RTX 3090", type="config", tags="infrastructure,gpu")
+```
+
+**Task tracking convention:**
+
+| Status | Tags | Meaning |
+|--------|------|---------|
+| Active | `active,...` | Currently being worked on |
+| Done | `done,...` | Completed successfully |
+| Blocked | `blocked,...` | Waiting on external input |
+
+### `unified_conversations`
+
+List or search conversation threads. Use to recall what was discussed.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `status` | string | ❌ | Filter: `active` / `resolved` / `blocked` / `archived` / `all` (default: `active`) |
+| `query` | string | ❌ | Search topic/tags/summary |
+| `limit` | number | ❌ | Max results (default: 10) |
+| `details` | boolean | ❌ | Include full details and messages (default: false) |
+
+**Examples:**
+```
+unified_conversations()                              # active threads
+unified_conversations(status="all", query="Docker")  # search all threads
+unified_conversations(status="resolved", limit=5)    # recent completed
+```
 
 ## Schema
 
 The SQLite database includes:
 
-- **skills** — learned procedures with success rates
-- **skill_executions** — execution history with timing and token usage
-- **unified_entries** — bridge table linking USMD ↔ HNSW entries
-- **tool_calls** — tool invocation log
-- **artifacts** — tracked files and outputs
-- **procedure_proposals** — proposed skill improvements
+| Table | Purpose |
+|-------|---------|
+| `skills` | Learned procedures with success rates |
+| `skill_executions` | Execution history with timing and token usage |
+| `unified_entries` | All stored entries (7 types) with FTS5 index |
+| `tool_calls` | Tool invocation log |
+| `artifacts` | Tracked files and outputs |
+| `patterns` | Detected recurring patterns with confidence |
+| `pattern_history` | Pattern confidence changes over time |
+| `conversations` | Conversation threads with lifecycle |
+| `conversation_messages` | Individual messages within threads |
+| `procedure_proposals` | Proposed skill improvements |
+| `hnsw_meta` | HNSW embedding metadata |
 
 See [schema.sql](schema.sql) for full DDL.
-
-## Hooks
-
-| Hook | Action |
-|------|--------|
-| `before_agent_start` | RAG slim: injects micro-summaries (20-30 tokens + keys) |
-| `after_tool_call` | Logs tool call to USMD + HNSW with auto-tags |
-| `agent_end` | Ends SONA trajectory with success/failure label |
 
 ## Migration
 

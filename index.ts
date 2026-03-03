@@ -188,7 +188,7 @@ function createRufloFromApi(api: PluginApi): RufloHNSW {
 // Qwen3 Embedding via Ollama (Spark) — 4096-dim semantic search
 // Added 2026-03-02 by Wiki. Falls back gracefully if Spark unreachable.
 // ============================================================================
-const QWEN_EMBED_URL = process.env.QWEN_EMBED_URL ?? "http://192.168.1.80:11434/v1/embeddings";
+const QWEN_EMBED_URL = process.env.QWEN_EMBED_URL ?? "http://localhost:11434/v1/embeddings";
 const QWEN_MODEL = "qwen3-embedding:8b";
 
 async function qwenEmbed(text: string): Promise<number[] | null> {

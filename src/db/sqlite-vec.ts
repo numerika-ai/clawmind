@@ -32,10 +32,11 @@ export class SqliteVecStore {
     store(entryId: number, text: string, embedding: number[], entryType: string): boolean {
         try {
             // Delete existing if present (upsert pattern)
-            this.db.prepare("DELETE FROM vec_entries WHERE entry_id = ?").run(entryId);
+            const id = BigInt(entryId);
+            this.db.prepare("DELETE FROM vec_entries WHERE entry_id = ?").run(id);
             this.db.prepare(
                 "INSERT INTO vec_entries (entry_id, embedding, entry_type, text) VALUES (?, ?, ?, ?)"
-            ).run(entryId, new Float32Array(embedding), entryType, text.slice(0, 500));
+            ).run(id, new Float32Array(embedding), entryType, text.slice(0, 500));
             return true;
         } catch (err) {
             this.logger.warn?.("sqlite-vec store failed:", String(err));
@@ -65,7 +66,8 @@ export class SqliteVecStore {
 
     delete(entryId: number): boolean {
         try {
-            this.db.prepare("DELETE FROM vec_entries WHERE entry_id = ?").run(entryId);
+            const id = BigInt(entryId);
+            this.db.prepare("DELETE FROM vec_entries WHERE entry_id = ?").run(id);
             return true;
         } catch {
             return false;

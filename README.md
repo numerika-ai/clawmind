@@ -15,28 +15,34 @@ One plugin that gives your agent:
 
 **Cost: $0/month** — uses local Qwen3-Embedding via Ollama (no OpenAI needed).
 
-## Architecture (v2.2)
+## Architecture
+
+**Current (v2.2):** SQLite + LanceDB (two separate stores). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+**Target (v3.0):** SQLite + sqlite-vec (single database file). See [docs/ARCHITECTURE-V3.md](docs/ARCHITECTURE-V3.md).
 
 ```
 ┌────────────────────────────────────────────────────┐
-│              memory-unified plugin                  │
-├──────────────────────┬─────────────────────────────┤
-│  SQLite (structured) │  LanceDB (vectors)     │
-│                      │                             │
-│ • unified_entries    │ • 4096-dim Qwen3 vectors    │
-│ • skills + patterns  │ • Disk-based columnar store   │
-│ • conversations      │ • Auto-embedded on store    │
-│ • tool_calls         │                             │
-│ • FTS5 keyword index │                             │
-└──────────────────────┴─────────────────────────────┘
-         │                        │
-    SQL + FTS5              Semantic similarity
-    (exact match)           (meaning-based)
+│              memory-unified plugin v3.0              │
+│                                                    │
+│         skill-memory.db (single file)              │
+│  ┌──────────────────┬─────────────────────────┐   │
+│  │  SQLite tables   │  vec0 virtual table     │   │
+│  │                  │                         │   │
+│  │ • unified_entries│ • vec_entries            │   │
+│  │ • skills         │   float[4096] cosine    │   │
+│  │ • conversations  │   metadata filtering    │   │
+│  │ • patterns       │   entry_type column     │   │
+│  │ • FTS5 index     │                         │   │
+│  └──────────────────┴─────────────────────────┘   │
+│         │                      │                   │
+│    SQL + FTS5           Semantic similarity         │
+│    (exact match)        (meaning-based)             │
+└────────────────────────────────────────────────────┘
 ```
 
-**Vector backend:** LanceDB (disk-based, filtered search, delete/update).  
-  
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
+**Vector backend:** sqlite-vec (brute-force KNN in-process, loaded into better-sqlite3 via `loadExtension`).
+**Why:** Single file, no async, ACID transactions, ~130MB fewer dependencies. See [v3.0 architecture](docs/ARCHITECTURE-V3.md) for full rationale.
 
 ## Entry Types
 
@@ -112,15 +118,15 @@ Add to `openclaw.json`:
 | Package | Purpose |
 |---------|---------|
 | `better-sqlite3` | SQLite database with FTS5 |
-
-| `@lancedb/lancedb` | Vector store (LanceDB) |
+| `sqlite-vec` | Vector search extension (v3.0, replaces LanceDB) |
 | `@sinclair/typebox` | Schema validation |
 
 ## Docs
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — full architecture + migration plan
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — current v2.2 architecture
+- [ARCHITECTURE-V3.md](docs/ARCHITECTURE-V3.md) — v3.0 migration plan (LanceDB → sqlite-vec)
 - [CHANGELOG.md](docs/CHANGELOG.md) — version history
 - [CUDA-SETUP.md](docs/CUDA-SETUP.md) — GPU embedding setup
 
 ---
-*Last edited by Wiki — 2026-03-04 10:03 UTC*
+*Last edited by Claude Code — 2026-03-04 17:52 UTC*

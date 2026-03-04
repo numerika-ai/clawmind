@@ -1,0 +1,162 @@
+/**
+ * db/lance-manager.ts — LanceDB vector index manager
+ *
+ * Wraps LanceVectorStore with SQLite hnsw_meta tracking,
+ * Qwen3 embedding via Ollama, and bulk indexing.
+ */
+
+import * as path from "node:path";
+import Database from "better-sqlite3";
+import { LanceVectorStore } from "./lancedb";
+import { qwenEmbed } from "../embedding/ollama";
+
+export class NativeLanceManager {
+  private lanceStore: LanceVectorStore;
+  private insertsSinceSave = 0;
+  private db: ReturnType<typeof Database>;
+  private logger: { info?(...a: unknown[]): void; warn?(...a: unknown[]): void; error?(...a: unknown[]): void };
+  private ready = false;
+
+  constructor(dbPath: string, db: ReturnType<typeof Database>, logger: any) {
+    this.db = db;
+    this.logger = logger;
+
+    // Create tracking table for which entries have been embedded
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS hnsw_meta (
+        entry_id INTEGER PRIMARY KEY,
+        embedded_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create LanceDB vector store
+    const lanceDbPath = path.join(path.dirname(dbPath), "memory-vectors.lance");
+    this.lanceStore = new LanceVectorStore(lanceDbPath, logger);
+
+    // Initialize LanceDB
+    this.lanceStore.init()
+      .then(() => {
+        this.ready = true;
+        logger.info?.(`memory-unified: LanceDB initialized (path: ${lanceDbPath})`);
+      })
+      .catch((err) => {
+        logger.error?.('memory-unified: LanceDB init failed:', String(err));
+        this.ready = false;
+      });
+  }
+
+  isReady(): boolean {
+    return this.ready;
+  }
+
+  getCount(): number {
+    if (!this.ready) return 0;
+    try {
+      const result = this.db.prepare('SELECT COUNT(*) as count FROM hnsw_meta').get() as { count: number };
+      return result.count;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Embed text and add to LanceDB index with the given unified_entries.id as label */
+  async addEntry(entryId: number, text: string): Promise<boolean> {
+    if (!this.ready) return false;
+
+    try {
+      // Skip if already embedded
+      const existing = this.db.prepare('SELECT 1 FROM hnsw_meta WHERE entry_id = ?').get(entryId);
+      if (existing) return true;
+
+      const embedding = await qwenEmbed(text);
+      if (!embedding || embedding.length !== 4096) return false;
+
+      // Get entry metadata for filtering
+      const entry = this.db.prepare('SELECT entry_type, tags FROM unified_entries WHERE id = ?').get(entryId) as any;
+      const metadata = {
+        entry_type: entry?.entry_type || '',
+        tags: entry?.tags || '',
+        created_at: new Date().toISOString()
+      };
+
+      // Store in LanceDB
+      const success = await this.lanceStore.store(entryId, text, embedding, metadata);
+      if (success) {
+        this.db.prepare('INSERT OR IGNORE INTO hnsw_meta (entry_id) VALUES (?)').run(entryId);
+        this.insertsSinceSave++;
+      }
+
+      return success;
+    } catch (err) {
+      this.logger.warn?.('memory-unified: LanceDB add failed:', String(err));
+      return false;
+    }
+  }
+
+  /** Search LanceDB for entries most similar to query text */
+  async search(query: string, topK = 5): Promise<Array<{ entryId: number; distance: number }>> {
+    if (!this.ready) return [];
+
+    try {
+      const embedding = await qwenEmbed(query);
+      if (!embedding || embedding.length !== 4096) return [];
+
+      const results = await this.lanceStore.search(embedding, topK);
+      return results;
+    } catch (err) {
+      this.logger.warn?.('memory-unified: LanceDB search failed:', String(err));
+      return [];
+    }
+  }
+
+  /** LanceDB auto-saves, so this is a no-op but maintained for interface compatibility */
+  save(): void {
+    this.insertsSinceSave = 0;
+    if (this.ready) {
+      this.logger.info?.(`memory-unified: LanceDB state consistent (auto-persisted)`);
+    }
+  }
+
+  /** Bulk-index existing entries that don't have embeddings yet (background) */
+  async bulkIndex(): Promise<void> {
+    if (!this.ready) return;
+
+    try {
+      const unembedded = this.db.prepare(`
+        SELECT ue.id, ue.summary, ue.content
+        FROM unified_entries ue
+        LEFT JOIN hnsw_meta hm ON hm.entry_id = ue.id
+        WHERE hm.entry_id IS NULL
+        ORDER BY ue.id DESC LIMIT 500
+      `).all() as any[];
+
+      if (unembedded.length === 0) {
+        this.logger.info?.('memory-unified: LanceDB bulk — all entries already embedded');
+        return;
+      }
+
+      this.logger.info?.(`memory-unified: LanceDB bulk indexing ${unembedded.length} entries...`);
+
+      let indexed = 0;
+      const BATCH = 10;
+      for (let i = 0; i < unembedded.length; i += BATCH) {
+        const batch = unembedded.slice(i, i + BATCH);
+        const results = await Promise.all(
+          batch.map((e: any) => {
+            const text = e.summary || (e.content || '').slice(0, 2000);
+            return text.length >= 10 ? this.addEntry(e.id, text) : Promise.resolve(false);
+          })
+        );
+        indexed += results.filter(Boolean).length;
+        // Throttle: 200ms between batches to not overwhelm Spark
+        if (i + BATCH < unembedded.length) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+
+      this.logger.info?.(`memory-unified: LanceDB bulk complete — ${indexed}/${unembedded.length} embedded`);
+    } catch (err) {
+      this.logger.warn?.('memory-unified: LanceDB bulk indexing failed:', String(err));
+    }
+  }
+}

@@ -4,6 +4,9 @@
   "description": "Unified memory plugin: USMD SQLite skill memory + LanceDB vector search",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "openclaw": {
+    "extensions": ["dist/index.js"]
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch"

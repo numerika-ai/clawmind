@@ -297,3 +297,40 @@ Table: vectors
 
 ---
 *Last edited by Claude Code — 2026-03-04 13:30 UTC*
+
+## Troubleshooting
+
+### "plugin not found: memory-unified"
+
+**Symptom:** Gateway logs show `plugins.slots.memory: plugin not found: memory-unified` on every startup.
+
+**Root cause:** OpenClaw's plugin discovery scans `~/.openclaw/extensions/` directories and requires either:
+1. An `"openclaw": { "extensions": ["dist/index.js"] }` field in `package.json`, OR
+2. A root-level `index.js` file
+
+Since the plugin was modularized (root `index.ts` deleted, entry point moved to `src/index.ts` → `dist/index.js`), neither condition was met. The plugin was invisible to the registry.
+
+**Fix:** Add to `package.json`:
+```json
+{
+  "openclaw": {
+    "extensions": ["dist/index.js"]
+  }
+}
+```
+
+### "HNSW store failed" spam in logs
+
+**Symptom:** Logs filled with `memory-unified: HNSW store failed:` every few seconds.
+
+**Root cause:** Legacy Ruflo MCP bridge code tried to POST to `http://127.0.0.1:3002/mcp` (Ruflo server not running). Every tool call triggered a fetch timeout.
+
+**Fix:** Removed in commit `f74eecb` — Ruflo bridge deleted, hnswlib-node uninstalled.
+
+### LanceDB "unified_vectors" table not found
+
+**Symptom:** LanceDB search returns empty results.
+
+**Root cause:** Table auto-creates on first write. If Spark (Qwen3 embeddings at `192.168.1.80:11434`) is unreachable, no vectors get stored.
+
+**Fix:** Verify Spark is up: `curl -s http://192.168.1.80:11434/v1/embeddings -H "Content-Type: application/json" -d '{"model":"qwen3-embedding:8b","input":"test"}'`

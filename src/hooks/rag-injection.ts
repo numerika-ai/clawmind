@@ -138,11 +138,11 @@ export function createRagInjectionHook(deps: HookDependencies) {
               const entry = entryMap.get(hr.entryId);
               if (!entry) continue;
               const sim = 1 - hr.distance;
-              if (sim < 0.35) continue;
+              if (sim < 0.50) continue; // raised from 0.35 — reduce false positives
 
               const name = (entry.hnsw_key || '').replace(/^(skill-full|skill|tool|history|config):/, '');
 
-              if (entry.entry_type === 'skill' && (entry.content || '').length > 500 && !matchedProcedure) {
+              if (entry.entry_type === 'skill' && (entry.content || '').length > 500 && !matchedProcedure && sim >= 0.60) { // require 60% for full procedure injection
                 matchedProcedure = (entry.content as string).slice(0, 4000);
                 memoryState.matchedSkillName = name;
                 memoryState.turnPrompt = prompt.slice(0, 500);
@@ -150,14 +150,14 @@ export function createRagInjectionHook(deps: HookDependencies) {
                   const skill = udb.getSkillByName(name);
                   if (skill) memoryState.matchedSkillId = skill.id;
                 } catch {}
-                slimLines.push(`[HNSW MATCH] ${name} (${(sim * 100).toFixed(0)}% semantic, ${entry.entry_type})`);
+                slimLines.push(`[VEC MATCH] ${name} (${(sim * 100).toFixed(0)}% semantic, ${entry.entry_type})`);
               } else {
-                slimLines.push(`[hnsw] ${name || entry.entry_type}:${entry.id} (${(sim * 100).toFixed(0)}%): ${(entry.summary || '').slice(0, 80)}`);
+                slimLines.push(`[vec] ${name || entry.entry_type}:${entry.id} (${(sim * 100).toFixed(0)}%): ${(entry.summary || '').slice(0, 80)}`);
               }
             }
           }
         } catch (hnswErr) {
-          api.logger.warn?.('memory-unified: HNSW search failed:', hnswErr);
+          api.logger.warn?.('memory-unified: vector search failed:', hnswErr);
         }
       }
 
@@ -168,7 +168,7 @@ export function createRagInjectionHook(deps: HookDependencies) {
         try {
           const qwenResults = await qwenSemanticSearch(prompt, udb.db, api.logger, 2);
           for (const r of qwenResults) {
-            if (r.content.length > 500 && !matchedProcedure) {
+            if (r.content.length > 500 && !matchedProcedure && r.similarity >= 0.60) { // require 60% for full procedure
               matchedProcedure = r.content.slice(0, 4000);
               memoryState.matchedSkillName = r.name;
               memoryState.turnPrompt = prompt.slice(0, 500);

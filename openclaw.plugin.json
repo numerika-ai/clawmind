@@ -3,31 +3,31 @@
   "kind": "memory",
   "uiHints": {
     "dbPath": {
-      "label": "USMD Database Path",
+      "label": "SQLite Database Path",
       "sensitive": false,
       "placeholder": "~/.openclaw/workspace/skill-memory.db",
-      "help": "Path to the USMD SQLite database. Created automatically if missing."
+      "help": "Path to the unified SQLite database. Created automatically if missing."
     },
     "ragSlim": {
-      "label": "RAG Slim on Agent Start",
+      "label": "RAG Injection on Agent Start",
       "sensitive": false,
-      "help": "Inject micro-summaries (20-30 tokens) from HNSW into agent context."
+      "help": "Inject relevant context from vector search + FTS5 into agent context."
     },
     "logToolCalls": {
-      "label": "Log Tool Calls to HNSW",
+      "label": "Log Tool Calls",
       "sensitive": false,
-      "help": "Store every tool call in Ruflo HNSW with skill tags."
+      "help": "Auto-log state-changing tool calls to memory."
     },
-    "trajectoryTracking": {
-      "label": "Trajectory Tracking",
+    "logToolWhitelist": {
+      "label": "Tool Call Whitelist",
       "sensitive": false,
-      "help": "Start/end SONA trajectories on agent lifecycle for self-learning."
+      "help": "Only log these tool prefixes (e.g. exec, message, gateway). Empty = log all."
     },
     "ragTopK": {
       "label": "RAG Top-K Results",
       "sensitive": false,
       "placeholder": "5",
-      "help": "Number of HNSW results to inject on agent start."
+      "help": "Number of vector search results to inject on agent start."
     }
   },
   "configSchema": {
@@ -37,7 +37,7 @@
       "dbPath": { "type": "string" },
       "ragSlim": { "type": "boolean" },
       "logToolCalls": { "type": "boolean" },
-      "trajectoryTracking": { "type": "boolean" },
+      "logToolWhitelist": { "type": "array", "items": { "type": "string" } },
       "ragTopK": { "type": "number" }
     }
   }

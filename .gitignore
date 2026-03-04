@@ -3,4 +3,5 @@ dist/
 *.bak*
 *.orig
 *.db
+*.hnsw
 .DS_Store

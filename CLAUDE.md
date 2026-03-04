@@ -1,64 +1,59 @@
-# OpenClaw Memory Unified Plugin — Reorganization
+# memory-unified — OpenClaw Plugin
 
-## Zadanie
-Reorganizacja repozytorium do profesjonalnej struktury. NIE zmieniaj logiki kodu — tylko przenieś pliki do nowej struktury i zaktualizuj importy.
+## Overview
+Unified memory for OpenClaw agents: SQLite (structured) + vector search (semantic) + Qwen3 embeddings (free, local).
 
-## Architektura
-- Język: TypeScript
-- Runtime: Node.js (OpenClaw plugin)
-- Baza: SQLite (better-sqlite3) + HNSW vectors
-- Repo: https://github.com/numerika-ai/openclaw-memory-unified
+**Repo:** https://github.com/numerika-ai/openclaw-memory-unified
+**Docs:** docs/ARCHITECTURE.md (current state + migration plan)
 
-## Obecna struktura (flat)
+## Architecture
+- **Runtime:** Node.js (OpenClaw extension)
+- **Database:** SQLite (better-sqlite3) + FTS5
+- **Vectors:** Currently hnswlib-node (migrating to LanceDB)
+- **Embeddings:** Qwen3-Embedding 8B via Ollama (Spark, 192.168.1.80:11434)
+- **Dimensions:** 4096
+
+## Code Structure
 ```
-index.ts          — główny plik (1671 linii, register tools + hooks)
-config.ts         — konfiguracja (60 linii)
-db.ts             — (nieużywany w prod, stary USMD)
-daemon.ts         — daemon service (83 linii)
-migrate.ts        — migracje schema (107 linii)
-```
-
-## Docelowa struktura
-```
-src/
-  index.ts           — main register(), hooks, startup
-  config.ts          — config schema + validation
-  migrate.ts         — schema migrations
-  daemon.ts          — daemon service
-  tools/
-    unified-search.ts
-    unified-store.ts
-    unified-conversations.ts
-  hooks/
-    on-turn-end.ts
-    rag-injection.ts
+src/                        ← Modular source (target)
+  config.ts                 ← Config schema + validation
+  daemon.ts                 ← Daemon service
+  migrate.ts                ← Schema migrations
+  types.ts                  ← Type definitions
+  db/
+    lancedb.ts              ← LanceDB vector store (Phase 2)
   embedding/
-    provider.ts       — abstract interface
-    ollama.ts         — Ollama/Qwen embeddings
+    ollama.ts               ← Ollama/Qwen embeddings
+    provider.ts             ← Abstract embedding interface
+  hooks/
+    on-turn-end.ts          ← Agent end hook (conversations, patterns)
+    rag-injection.ts        ← Before agent start RAG injection
+  tools/
+    unified-search.ts       ← Search tool
+    unified-store.ts        ← Store tool
+    unified-conversations.ts ← Conversations tool
   utils/
-    hnsw.ts           — HNSW vector operations
-    auto-tag.ts       — classification
+    helpers.ts              ← Tag classification, utilities
+    hnsw.ts                 ← HNSW vector operations (to be replaced)
+
+index.ts                    ← Current monolith (897 lines, compiles to dist/)
+dist/index.js               ← Compiled monolith (what actually runs)
 docs/
-  ARCHITECTURE.md     — skopiuj z workspace (podany niżej)
-  SETUP.md            — installation guide
-  API.md              — tool reference
-tests/
-  (placeholder test files)
+  ARCHITECTURE.md           ← Full architecture + migration plan
+  CHANGELOG.md              ← Version history
+  CUDA-SETUP.md             ← GPU embedding setup
 ```
 
-## Ważne
-- NIE zmieniaj logiki kodu — TYLKO reorganizuj
-- Zachowaj WSZYSTKIE exporty z index.ts
-- Po przeniesieniu: upewnij się że `npm run build` działa
-- Zaktualizuj package.json jeśli trzeba
-- Zaktualizuj README.md z nową strukturą
-- Skopiuj /home/tank/.openclaw/workspace/UNIFIED-MEMORY-ARCHITECTURE.md do docs/ARCHITECTURE.md
+## Current State
+- `dist/index.js` is compiled from root `index.ts` (monolith)
+- `src/` has modular structure but is NOT yet wired as entry point
+- Phase 2 will: finish modularization + replace hnswlib-node with LanceDB
 
-## Konwencje
-- Importy: relative paths
-- Każdy tool w osobnym pliku
-- Każdy hook w osobnym pliku
+## Build
+```bash
+npm run build    # tsc → dist/
+```
 
-## Testy
-- Placeholder test files (describe + it blocks, TODO implementation)
-- Uruchomienie: `npx tsc --noEmit` (type check)
+## Key Constraint
+- **DO NOT break dist/index.js** — it's the running production plugin
+- Test changes by restarting gateway: `openclaw gateway restart`

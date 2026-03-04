@@ -1,13 +1,12 @@
 /**
  * memory-unified — OpenClaw Plugin
  *
- * Merges USMD SQLite skill memory with Ruflo HNSW vector search.
- * Hooks: before_agent_start (RAG slim), on_tool_call (log to HNSW),
+ * Merges USMD SQLite skill memory with LanceDB vector search.
+ * Hooks: before_agent_start (RAG slim), on_tool_call (log to LanceDB),
  *        agent_end (trajectory end with success/failure label).
  * CLI:   openclaw ingest <path> — chunk, auto-tag, embed, store.
  */
 
-import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@sinclair/typebox";
@@ -16,7 +15,7 @@ import { unifiedConfigSchema, type UnifiedMemoryConfig, ENTRY_TYPES, type EntryT
 import { LanceVectorStore } from "./src/db/lancedb";
 
 // Import extracted components
-import type { PluginApi, ToolResult, ToolDef, RufloHNSW, UnifiedDB } from "./src/types";
+import type { PluginApi, ToolResult, ToolDef, UnifiedDB } from "./src/types";
 import { createUnifiedSearchTool } from "./src/tools/unified-search";
 import { createUnifiedStoreTool } from "./src/tools/unified-store";
 import { createUnifiedConversationsTool } from "./src/tools/unified-conversations";
@@ -34,134 +33,6 @@ import {
   isDecision,
   isResolution
 } from "./src/utils/helpers";
-
-// ============================================================================
-// Ruflo HNSW bridge — calls MCP tools at runtime
-// ============================================================================
-
-/**
- * We don't import Ruflo directly — we call the MCP tools that are already
- * registered in the OpenClaw runtime. This module provides a thin async
- * wrapper that the plugin hooks will use.
- */
-
-// Stub that will be replaced by the runtime tool executor
-let ruflo: RufloHNSW | null = null;
-
-/**
- * Direct HTTP bridge to Ruflo MCP server (port 3002).
- * Replaces the file-queue stub with real synchronous calls.
- * Fixed 2026-03-01 by Wiki — original Hermes code used file queue (always returned []).
- */
-function createRufloFromApi(api: PluginApi): RufloHNSW {
-  const RUFLO_URL = process.env.RUFLO_MCP_URL ?? "http://127.0.0.1:3002/mcp";
-  let sessionId: string | null = null;
-  let reqId = 0;
-
-  async function mcpCall(toolName: string, args: Record<string, unknown>): Promise<any> {
-    const body = JSON.stringify({
-      jsonrpc: "2.0",
-      method: "tools/call",
-      id: ++reqId,
-      params: { name: toolName, arguments: args },
-    });
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    };
-    if (sessionId) headers["Mcp-Session-Id"] = sessionId;
-
-    const resp = await fetch(RUFLO_URL, { method: "POST", headers, body, signal: AbortSignal.timeout(8000) });
-    const sid = resp.headers.get("Mcp-Session-Id");
-    if (sid) sessionId = sid;
-
-    const text = await resp.text();
-    const lines = text.split("\n").filter((l: string) => l.startsWith("data: "));
-    for (const line of lines) {
-      try {
-        const parsed = JSON.parse(line.slice(6));
-        if (parsed.result) return parsed.result;
-        if (parsed.error) throw new Error(parsed.error.message ?? JSON.stringify(parsed.error));
-      } catch (e) {
-        if (e instanceof SyntaxError) continue;
-        throw e;
-      }
-    }
-    try { const p = JSON.parse(text); return p.result ?? p; } catch { /* ignore */ }
-    return null;
-  }
-
-  return {
-    async store(key, value, opts) {
-      try {
-        const valStr = typeof value === "string" ? value : JSON.stringify(value);
-        await mcpCall("memory_store", {
-          key, value: valStr,
-          namespace: opts?.namespace ?? "unified",
-          tags: JSON.stringify(opts?.tags ?? []),
-          upsert: true,
-        });
-      } catch (err) {
-        api.logger.warn?.("memory-unified: HNSW store failed:", err);
-      }
-    },
-
-    async search(query, opts) {
-      try {
-        const result = await mcpCall("memory_search", {
-          query, namespace: opts?.namespace ?? "unified",
-          limit: opts?.limit ?? 5, threshold: opts?.threshold ?? 0.3,
-        });
-        if (result?.content?.[0]?.text) {
-          const parsed = JSON.parse(result.content[0].text);
-          if (parsed.results && Array.isArray(parsed.results)) {
-            return parsed.results.map((r: any) => ({
-              key: r.key, value: r.value,
-              similarity: r.similarity ?? r.score ?? 0.5,
-            }));
-          }
-        }
-        return [];
-      } catch (err) {
-        api.logger.warn?.("memory-unified: HNSW search failed:", err);
-        return [];
-      }
-    },
-
-    async trajectoryStart(task, agent) {
-      const fallbackId = `traj-${Date.now()}-${randomUUID().slice(0, 6)}`;
-      try {
-        const result = await mcpCall("hooks_intelligence_trajectory-start", {
-          task: task.slice(0, 200), agent: agent ?? "memory-unified",
-        });
-        // Extract real Ruflo trajectory ID from response
-        const text = result?.content?.[0]?.text;
-        if (text) {
-          const parsed = typeof text === "string" ? JSON.parse(text) : text;
-          if (parsed.trajectoryId) return parsed.trajectoryId;
-        }
-        return fallbackId;
-      } catch { return fallbackId; }
-    },
-
-    async trajectoryStep(trajectoryId, action, result, quality) {
-      try {
-        await mcpCall("hooks_intelligence_trajectory-step", {
-          trajectoryId, action, result: result.slice(0, 200), quality: quality ?? 0.5,
-        });
-      } catch { /* non-critical */ }
-    },
-
-    async trajectoryEnd(trajectoryId, success, feedback) {
-      try {
-        await mcpCall("hooks_intelligence_trajectory-end", {
-          trajectoryId, success, feedback: feedback ?? "",
-        });
-      } catch { /* non-critical */ }
-    },
-  };
-}
 
 // ============================================================================
 // Qwen3 Embedding via Ollama (Spark) — 4096-dim semantic search
@@ -600,8 +471,8 @@ CREATE INDEX IF NOT EXISTS idx_unified_hnsw ON unified_entries(hnsw_key);
 // ============================================================================
 const memoryUnifiedPlugin = {
   id: "memory-unified",
-  name: "Memory Unified (USMD + HNSW)",
-  description: "Unified memory: USMD SQLite for structured skills + Ruflo HNSW for semantic search. RAG slim, tool logging, trajectory tracking.",
+  name: "Memory Unified (USMD + LanceDB)",
+  description: "Unified memory: USMD SQLite for structured skills + LanceDB for semantic search. RAG slim, tool logging, trajectory tracking.",
   kind: "memory" as const,
   configSchema: unifiedConfigSchema,
 
@@ -624,8 +495,6 @@ const memoryUnifiedPlugin = {
       api.logger.error?.("memory-unified: DB init failed:", err);
       throw err;
     }
-
-    ruflo = createRufloFromApi(api);
 
     // Shared state across hooks
     const memoryState = {
@@ -655,7 +524,7 @@ const memoryUnifiedPlugin = {
     if (cfg.ragSlim) {
       const ragHook = createRagInjectionHook({
         udb,
-        ruflo,
+        ruflo: null,
         lanceManager,
         cfg,
         memoryState,
@@ -674,7 +543,7 @@ const memoryUnifiedPlugin = {
     if (cfg.logToolCalls) {
       const toolCallHook = createToolCallLogHook({
         udb,
-        ruflo,
+        ruflo: null,
         lanceManager,
         cfg,
         memoryState,
@@ -691,7 +560,7 @@ const memoryUnifiedPlugin = {
     if (cfg.trajectoryTracking) {
       const agentEndHook = createAgentEndHook({
         udb,
-        ruflo,
+        ruflo: null,
         lanceManager,
         cfg,
         memoryState,
@@ -796,8 +665,8 @@ const memoryUnifiedPlugin = {
     // ========================================================================
     // Tools: Register all four tools
     // ========================================================================
-    api.registerTool(createUnifiedSearchTool(udb, ruflo), { name: "unified_search" });
-    api.registerTool(createUnifiedStoreTool(udb, ruflo, lanceManager), { name: "unified_store" });
+    api.registerTool(createUnifiedSearchTool(udb, null), { name: "unified_search" });
+    api.registerTool(createUnifiedStoreTool(udb, null, lanceManager), { name: "unified_store" });
     api.registerTool(createUnifiedConversationsTool(udb), { name: "unified_conversations" });
     api.registerTool(createUnifiedIndexFilesTool(udb), { name: "unified_index_files" });
 
@@ -855,10 +724,6 @@ const memoryUnifiedPlugin = {
                 sourcePath: file,
                 hnswKey,
               });
-
-              if (ruflo) {
-                await ruflo.store(hnswKey, { chunk: chunk.slice(0, 2000), summary: sum, source: file, tags }, { tags: [path.basename(file), ...tags], namespace: "unified" });
-              }
 
               totalChunks++;
             }

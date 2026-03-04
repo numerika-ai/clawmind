@@ -117,11 +117,14 @@ export class NativeLanceManager {
     }
   }
 
-  /** Bulk-index existing entries that don't have embeddings yet (background) */
+  /** Bulk-index ALL entries into unified_vectors (resets hnsw_meta to re-embed everything) */
   async bulkIndex(): Promise<void> {
     if (!this.ready) return;
 
     try {
+      // Reset tracking so all entries get re-embedded into the new unified_vectors table
+      this.db.exec('DELETE FROM hnsw_meta');
+
       const unembedded = this.db.prepare(`
         SELECT ue.id, ue.summary, ue.content
         FROM unified_entries ue
@@ -143,7 +146,7 @@ export class NativeLanceManager {
         const batch = unembedded.slice(i, i + BATCH);
         const results = await Promise.all(
           batch.map((e: any) => {
-            const text = e.summary || (e.content || '').slice(0, 2000);
+            const text = e.summary || (e.content || '').slice(0, 500);
             return text.length >= 10 ? this.addEntry(e.id, text) : Promise.resolve(false);
           })
         );

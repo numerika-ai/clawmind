@@ -16,7 +16,7 @@ export interface VectorMetadata {
 export class LanceVectorStore {
   private db: Database | null = null;
   private table: Table | null = null;
-  private readonly tableName = 'vectors';
+  private readonly tableName = 'unified_vectors';
   
   constructor(
     private readonly dbPath: string,
@@ -34,7 +34,7 @@ export class LanceVectorStore {
       const tableNames = await this.db.tableNames();
       
       if (!tableNames.includes(this.tableName)) {
-        this.logger.info('Creating vectors table in LanceDB');
+        this.logger.info('Creating unified_vectors table in LanceDB');
         
         // Create table with schema
         // LanceDB requires at least one row to create the table
@@ -52,7 +52,7 @@ export class LanceVectorStore {
         // Delete the sample row
         if (this.table) await this.table.delete('entry_id = 0');
       } else {
-        this.logger.info('Using existing vectors table in LanceDB');
+        this.logger.info('Using existing unified_vectors table in LanceDB');
         this.table = await this.db.openTable(this.tableName);
       }
       
@@ -83,7 +83,7 @@ export class LanceVectorStore {
       // Prepare the data
       const data = [{
         entry_id: entryId,
-        text: text.slice(0, 2000), // Limit text to first 2000 chars
+        text: text.slice(0, 500), // Limit text to first 500 chars
         vector: embedding,
         entry_type: metadata.entry_type || '',
         tags: metadata.tags || '',

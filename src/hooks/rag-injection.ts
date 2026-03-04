@@ -9,7 +9,7 @@ interface MemoryState {
   turnPrompt: string | null;
 }
 
-interface NativeHnswManager {
+interface NativeLanceManager {
   isReady(): boolean;
   search(query: string, topK?: number): Promise<Array<{ entryId: number; distance: number }>>;
 }
@@ -25,7 +25,7 @@ interface ExtractKeywordsFunction {
 interface HookDependencies {
   udb: UnifiedDB;
   ruflo: RufloHNSW | null;
-  hnswManager: NativeHnswManager | null;
+  lanceManager: NativeLanceManager | null;
   cfg: UnifiedMemoryConfig;
   memoryState: MemoryState;
   qwenSemanticSearch: QwenSearchFunction;
@@ -37,7 +37,7 @@ interface HookDependencies {
  * This hook performs multi-layer memory search and injects context
  */
 export function createRagInjectionHook(deps: HookDependencies) {
-  const { udb, ruflo, hnswManager, cfg, memoryState, qwenSemanticSearch, extractKeywords } = deps;
+  const { udb, ruflo, lanceManager, cfg, memoryState, qwenSemanticSearch, extractKeywords } = deps;
 
   return async function(api: PluginApi, event: Record<string, unknown>) {
     const prompt = event.prompt as string | undefined;
@@ -122,9 +122,9 @@ export function createRagInjectionHook(deps: HookDependencies) {
       // ============================================================
       // STEP 2.5: Native HNSW vector search
       // ============================================================
-      if (hnswManager?.isReady()) {
+      if (lanceManager?.isReady()) {
         try {
-          const hnswResults = await hnswManager.search(prompt, 5);
+          const hnswResults = await lanceManager.search(prompt, 5);
           if (hnswResults.length > 0) {
             const hnswEntryIds = hnswResults.map(r => r.entryId);
             const placeholders = hnswEntryIds.map(() => '?').join(',');

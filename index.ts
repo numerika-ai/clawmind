@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { Type } from "@sinclair/typebox";
 import Database from "better-sqlite3";
 import { unifiedConfigSchema, type UnifiedMemoryConfig, ENTRY_TYPES, type EntryType } from "./src/config";
-import { HierarchicalNSW } from "hnswlib-node";
+import { LanceVectorStore } from "./src/db/lancedb";
 
 // Import extracted components
 import type { PluginApi, ToolResult, ToolDef, RufloHNSW, UnifiedDB } from "./src/types";
@@ -250,23 +250,21 @@ async function qwenSemanticSearch(query: string, db: any, logger: any, topK = 3)
 // Native HNSW Index Manager — hnswlib-node with Qwen3 4096-dim embeddings
 // Added 2026-03-02 by Wiki — Phase 0: replaces Ruflo MCP HNSW dependency
 // ============================================================================
-const HNSW_DIMS = 4096;
-const HNSW_MAX_ELEMENTS = 50000;
-const HNSW_M = 16;
-const HNSW_EF_CONSTRUCTION = 200;
-const HNSW_EF_SEARCH = 100;
-const HNSW_SAVE_EVERY = 10; // auto-save every N inserts
+// const HNSW_DIMS = 4096; // No longer needed - LanceDB uses 4096 dims
+// const HNSW_MAX_ELEMENTS = 50000; // No longer needed - LanceDB scales dynamically
+// const HNSW_M = 16; // No longer needed - LanceDB uses different indexing
+// const HNSW_EF_CONSTRUCTION = 200; // No longer needed - LanceDB uses different parameters
+// const HNSW_EF_SEARCH = 100; // No longer needed - LanceDB uses different parameters
+// const HNSW_SAVE_EVERY = 10; // auto-save every N inserts - No longer needed for LanceDB
 
-class NativeHnswManager {
-  private index: HierarchicalNSW;
-  private indexPath: string;
+class NativeLanceManager {
+  private lanceStore: LanceVectorStore;
   private insertsSinceSave = 0;
   private db: ReturnType<typeof Database>;
   private logger: { info?(...a: unknown[]): void; warn?(...a: unknown[]): void; error?(...a: unknown[]): void };
   private ready = false;
 
-  constructor(indexPath: string, db: ReturnType<typeof Database>, logger: any) {
-    this.indexPath = indexPath;
+  constructor(dbPath: string, db: ReturnType<typeof Database>, logger: any) {
     this.db = db;
     this.logger = logger;
 
@@ -278,107 +276,101 @@ class NativeHnswManager {
       )
     `);
 
-    // Create or load HNSW index
-    this.index = new HierarchicalNSW('cosine', HNSW_DIMS);
+    // Create LanceDB vector store
+    const lanceDbPath = path.join(path.dirname(dbPath), "memory-vectors.lance");
+    this.lanceStore = new LanceVectorStore(lanceDbPath, logger);
 
-    try {
-      if (fs.existsSync(indexPath)) {
-        this.index.readIndexSync(indexPath);
-        this.index.setEf(HNSW_EF_SEARCH);
+    // Initialize LanceDB
+    this.lanceStore.init()
+      .then(() => {
         this.ready = true;
-        logger.info?.(`memory-unified: HNSW loaded (${this.index.getCurrentCount()} vectors, ${HNSW_DIMS}d)`);
-      } else {
-        this.index.initIndex(HNSW_MAX_ELEMENTS, HNSW_M, HNSW_EF_CONSTRUCTION);
-        this.index.setEf(HNSW_EF_SEARCH);
-        this.ready = true;
-        logger.info?.(`memory-unified: HNSW created new index (max ${HNSW_MAX_ELEMENTS}, ${HNSW_DIMS}d)`);
-      }
-    } catch (err) {
-      // Corrupted index file — recreate from scratch
-      logger.warn?.('memory-unified: HNSW load failed, recreating:', String(err));
-      try {
-        this.index.initIndex(HNSW_MAX_ELEMENTS, HNSW_M, HNSW_EF_CONSTRUCTION);
-        this.index.setEf(HNSW_EF_SEARCH);
-        this.db.exec('DELETE FROM hnsw_meta'); // clear stale tracking
-        this.ready = true;
-        logger.info?.('memory-unified: HNSW recreated (old index was corrupted)');
-      } catch (err2) {
-        logger.error?.('memory-unified: HNSW init completely failed:', String(err2));
+        logger.info?.(`memory-unified: LanceDB initialized (path: ${lanceDbPath})`);
+      })
+      .catch((err) => {
+        logger.error?.('memory-unified: LanceDB init failed:', String(err));
         this.ready = false;
-      }
+      });
+  }
+
+  isReady(): boolean { 
+    return this.ready; 
+  }
+
+  getCount(): number { 
+    if (!this.ready) return 0;
+    // Note: LanceDB count is async, but this interface expects sync
+    // We'll return the count from hnsw_meta table as a fallback
+    try {
+      const result = this.db.prepare('SELECT COUNT(*) as count FROM hnsw_meta').get() as { count: number };
+      return result.count;
+    } catch {
+      return 0;
     }
   }
 
-  isReady(): boolean { return this.ready; }
-  getCount(): number { return this.ready ? this.index.getCurrentCount() : 0; }
-
-  /** Embed text and add to HNSW index with the given unified_entries.id as label */
+  /** Embed text and add to LanceDB index with the given unified_entries.id as label */
   async addEntry(entryId: number, text: string): Promise<boolean> {
     if (!this.ready) return false;
+    
     try {
       // Skip if already embedded
       const existing = this.db.prepare('SELECT 1 FROM hnsw_meta WHERE entry_id = ?').get(entryId);
       if (existing) return true;
 
       const embedding = await qwenEmbed(text);
-      if (!embedding || embedding.length !== HNSW_DIMS) return false;
+      if (!embedding || embedding.length !== 4096) return false;
 
-      // Auto-resize if nearing capacity
-      if (this.index.getCurrentCount() >= this.index.getMaxElements() - 1) {
-        const newMax = this.index.getMaxElements() + 10000;
-        this.index.resizeIndex(newMax);
-        this.logger.info?.(`memory-unified: HNSW resized to ${newMax}`);
+      // Get entry metadata for filtering
+      const entry = this.db.prepare('SELECT entry_type, tags FROM unified_entries WHERE id = ?').get(entryId) as any;
+      const metadata = {
+        entry_type: entry?.entry_type || '',
+        tags: entry?.tags || '',
+        created_at: new Date().toISOString()
+      };
+
+      // Store in LanceDB
+      const success = await this.lanceStore.store(entryId, text, embedding, metadata);
+      if (success) {
+        this.db.prepare('INSERT OR IGNORE INTO hnsw_meta (entry_id) VALUES (?)').run(entryId);
+        this.insertsSinceSave++;
       }
-
-      this.index.addPoint(embedding, entryId);
-      this.db.prepare('INSERT OR IGNORE INTO hnsw_meta (entry_id) VALUES (?)').run(entryId);
-
-      this.insertsSinceSave++;
-      if (this.insertsSinceSave >= HNSW_SAVE_EVERY) {
-        this.save();
-      }
-      return true;
+      
+      return success;
     } catch (err) {
-      this.logger.warn?.('memory-unified: HNSW add failed:', String(err));
+      this.logger.warn?.('memory-unified: LanceDB add failed:', String(err));
       return false;
     }
   }
 
-  /** Search HNSW for entries most similar to query text */
+  /** Search LanceDB for entries most similar to query text */
   async search(query: string, topK = 5): Promise<Array<{ entryId: number; distance: number }>> {
-    if (!this.ready || this.index.getCurrentCount() === 0) return [];
+    if (!this.ready) return [];
+    
     try {
       const embedding = await qwenEmbed(query);
-      if (!embedding || embedding.length !== HNSW_DIMS) return [];
+      if (!embedding || embedding.length !== 4096) return [];
 
-      const k = Math.min(topK, this.index.getCurrentCount());
-      const result = this.index.searchKnn(embedding, k);
-
-      return result.neighbors.map((label, i) => ({
-        entryId: label,
-        distance: result.distances[i],
-      }));
+      const results = await this.lanceStore.search(embedding, topK);
+      return results;
     } catch (err) {
-      this.logger.warn?.('memory-unified: HNSW search failed:', String(err));
+      this.logger.warn?.('memory-unified: LanceDB search failed:', String(err));
       return [];
     }
   }
 
-  /** Persist HNSW index to disk */
+  /** LanceDB auto-saves, so this is a no-op but maintained for interface compatibility */
   save(): void {
-    if (!this.ready) return;
-    try {
-      this.index.writeIndexSync(this.indexPath);
-      this.insertsSinceSave = 0;
-      this.logger.info?.(`memory-unified: HNSW saved (${this.index.getCurrentCount()} vectors)`);
-    } catch (err) {
-      this.logger.warn?.('memory-unified: HNSW save failed:', String(err));
+    // LanceDB auto-persists, no explicit save needed
+    this.insertsSinceSave = 0;
+    if (this.ready) {
+      this.logger.info?.(`memory-unified: LanceDB state consistent (auto-persisted)`);
     }
   }
 
   /** Bulk-index existing entries that don't have embeddings yet (background) */
   async bulkIndex(): Promise<void> {
     if (!this.ready) return;
+    
     try {
       const unembedded = this.db.prepare(`
         SELECT ue.id, ue.summary, ue.content
@@ -389,11 +381,11 @@ class NativeHnswManager {
       `).all() as any[];
 
       if (unembedded.length === 0) {
-        this.logger.info?.('memory-unified: HNSW bulk — all entries already embedded');
+        this.logger.info?.('memory-unified: LanceDB bulk — all entries already embedded');
         return;
       }
 
-      this.logger.info?.(`memory-unified: HNSW bulk indexing ${unembedded.length} entries...`);
+      this.logger.info?.(`memory-unified: LanceDB bulk indexing ${unembedded.length} entries...`);
 
       let indexed = 0;
       const BATCH = 10;
@@ -412,10 +404,9 @@ class NativeHnswManager {
         }
       }
 
-      this.save();
-      this.logger.info?.(`memory-unified: HNSW bulk complete — ${indexed}/${unembedded.length} embedded`);
+      this.logger.info?.(`memory-unified: LanceDB bulk complete — ${indexed}/${unembedded.length} embedded`);
     } catch (err) {
-      this.logger.warn?.('memory-unified: HNSW bulk indexing failed:', String(err));
+      this.logger.warn?.('memory-unified: LanceDB bulk indexing failed:', String(err));
     }
   }
 }
@@ -647,13 +638,13 @@ const memoryUnifiedPlugin = {
     // ========================================================================
     // HNSW Native Index — Phase 0 (replaces Ruflo MCP HNSW)
     // ========================================================================
-    const hnswIndexPath = path.join(path.dirname(resolvedDbPath), "skill-memory.hnsw");
-    let hnswManager: NativeHnswManager | null = null;
+    // LanceDB path will be derived inside NativeLanceManager
+    let lanceManager: NativeLanceManager | null = null;
     try {
-      hnswManager = new NativeHnswManager(hnswIndexPath, udb.db, api.logger);
-      api.logger.info?.(`memory-unified: HNSW manager ready (${hnswManager.getCount()} vectors)`);
+      lanceManager = new NativeLanceManager(resolvedDbPath, udb.db, api.logger);
+      api.logger.info?.(`memory-unified: LanceDB manager ready (${lanceManager.getCount()} vectors)`);
     } catch (hnswErr) {
-      api.logger.warn?.('memory-unified: HNSW manager init failed, continuing without:', String(hnswErr));
+      api.logger.warn?.('memory-unified: LanceDB manager init failed, continuing without:', String(hnswErr));
     }
 
     api.logger.info?.(`memory-unified: initialized (db: ${resolvedDbPath})`);
@@ -665,7 +656,7 @@ const memoryUnifiedPlugin = {
       const ragHook = createRagInjectionHook({
         udb,
         ruflo,
-        hnswManager,
+        lanceManager,
         cfg,
         memoryState,
         qwenSemanticSearch,
@@ -684,7 +675,7 @@ const memoryUnifiedPlugin = {
       const toolCallHook = createToolCallLogHook({
         udb,
         ruflo,
-        hnswManager,
+        lanceManager,
         cfg,
         memoryState,
       });
@@ -701,7 +692,7 @@ const memoryUnifiedPlugin = {
       const agentEndHook = createAgentEndHook({
         udb,
         ruflo,
-        hnswManager,
+        lanceManager,
         cfg,
         memoryState,
       });
@@ -806,7 +797,7 @@ const memoryUnifiedPlugin = {
     // Tools: Register all four tools
     // ========================================================================
     api.registerTool(createUnifiedSearchTool(udb, ruflo), { name: "unified_search" });
-    api.registerTool(createUnifiedStoreTool(udb, ruflo, hnswManager), { name: "unified_store" });
+    api.registerTool(createUnifiedStoreTool(udb, ruflo, lanceManager), { name: "unified_store" });
     api.registerTool(createUnifiedConversationsTool(udb), { name: "unified_conversations" });
     api.registerTool(createUnifiedIndexFilesTool(udb), { name: "unified_index_files" });
 
@@ -887,15 +878,15 @@ const memoryUnifiedPlugin = {
       start: () => {
         api.logger.info?.(`memory-unified: service started (db: ${resolvedDbPath})`);
         // Kick off HNSW bulk indexing in background (fire and forget)
-        if (hnswManager?.isReady()) {
-          hnswManager.bulkIndex().catch(err => api.logger.warn?.("memory-unified: HNSW bulk failed:", String(err)));
+        if (lanceManager?.isReady()) {
+          lanceManager.bulkIndex().catch(err => api.logger.warn?.("memory-unified: LanceDB bulk failed:", String(err)));
         }
       },
       stop: () => {
         // Save HNSW index before shutdown
-        if (hnswManager?.isReady()) {
-          hnswManager.save();
-          api.logger.info?.("memory-unified: HNSW saved on shutdown");
+        if (lanceManager?.isReady()) {
+          lanceManager.save();
+          api.logger.info?.("memory-unified: LanceDB saved on shutdown");
         }
         udb.close();
         api.logger.info?.("memory-unified: service stopped");

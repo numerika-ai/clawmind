@@ -19,7 +19,7 @@ interface MemoryState {
   turnPrompt: string | null;
 }
 
-interface NativeHnswManager {
+interface NativeLanceManager {
   isReady(): boolean;
   addEntry(entryId: number, text: string): Promise<boolean>;
 }
@@ -27,7 +27,7 @@ interface NativeHnswManager {
 interface HookDependencies {
   udb: UnifiedDB;
   ruflo: RufloHNSW | null;
-  hnswManager: NativeHnswManager | null;
+  lanceManager: NativeLanceManager | null;
   cfg: UnifiedMemoryConfig;
   memoryState: MemoryState;
 }
@@ -36,7 +36,7 @@ interface HookDependencies {
  * Creates the tool call logging hook for after_tool_call
  */
 export function createToolCallLogHook(deps: HookDependencies) {
-  const { udb, ruflo, hnswManager, memoryState } = deps;
+  const { udb, ruflo, lanceManager, memoryState } = deps;
 
   return async function(api: PluginApi, event: Record<string, unknown>) {
     try {
@@ -74,8 +74,8 @@ export function createToolCallLogHook(deps: HookDependencies) {
       }
 
       // Native HNSW indexing (fire and forget, don't block agent)
-      if (hnswManager?.isReady()) {
-        hnswManager.addEntry(toolEntryId, summary).catch(() => {});
+      if (lanceManager?.isReady()) {
+        lanceManager.addEntry(toolEntryId, summary).catch(() => {});
       }
 
       // MoE Auto-Routing: when sessions_spawn is called, log the model routing decision

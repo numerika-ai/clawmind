@@ -11,9 +11,12 @@ import { LanceVectorStore } from "./lancedb";
 import { qwenEmbed } from "../embedding/ollama";
 import type { SqliteVecStore } from "./sqlite-vec";
 
+export type VectorBackend = "lancedb" | "sqlite-vec" | "dual";
+
 export class NativeLanceManager {
   private lanceStore: LanceVectorStore;
   private sqliteVecStore: SqliteVecStore | null = null;
+  private vectorBackend: VectorBackend = "lancedb";
   private insertsSinceSave = 0;
   private db: ReturnType<typeof Database>;
   private logger: { info?(...a: unknown[]): void; warn?(...a: unknown[]): void; error?(...a: unknown[]): void };
@@ -47,9 +50,19 @@ export class NativeLanceManager {
       });
   }
 
-  /** Attach a SqliteVecStore for Phase 1 dual-write */
+  /** Attach a SqliteVecStore for dual-write and optional search routing */
   setSqliteVecStore(store: SqliteVecStore): void {
     this.sqliteVecStore = store;
+  }
+
+  /** Set the vector search backend: "lancedb" (default), "sqlite-vec", or "dual" */
+  setVectorBackend(backend: VectorBackend): void {
+    this.vectorBackend = backend;
+    this.logger.info?.(`memory-unified: vector search backend set to "${backend}"`);
+  }
+
+  getVectorBackend(): VectorBackend {
+    return this.vectorBackend;
   }
 
   isReady(): boolean {
@@ -105,7 +118,7 @@ export class NativeLanceManager {
     }
   }
 
-  /** Search LanceDB for entries most similar to query text */
+  /** Search for entries most similar to query text, routed by vectorBackend setting */
   async search(query: string, topK = 5): Promise<Array<{ entryId: number; distance: number }>> {
     if (!this.ready) return [];
 
@@ -113,12 +126,46 @@ export class NativeLanceManager {
       const embedding = await qwenEmbed(query);
       if (!embedding || embedding.length !== 4096) return [];
 
-      const results = await this.lanceStore.search(embedding, topK);
-      return results;
+      if (this.vectorBackend === "sqlite-vec" && this.sqliteVecStore) {
+        return this.sqliteVecStore.search(embedding, topK);
+      }
+
+      if (this.vectorBackend === "dual" && this.sqliteVecStore) {
+        const [lanceResults, vecResults] = await Promise.all([
+          this.lanceStore.search(embedding, topK),
+          Promise.resolve(this.sqliteVecStore.search(embedding, topK)),
+        ]);
+        return this.mergeResults(lanceResults, vecResults, topK);
+      }
+
+      // Default: lancedb
+      return await this.lanceStore.search(embedding, topK);
     } catch (err) {
-      this.logger.warn?.('memory-unified: LanceDB search failed:', String(err));
+      this.logger.warn?.('memory-unified: vector search failed:', String(err));
       return [];
     }
+  }
+
+  /** Merge results from two backends, deduplicate by entryId, keep best distance */
+  private mergeResults(
+    a: Array<{ entryId: number; distance: number }>,
+    b: Array<{ entryId: number; distance: number }>,
+    topK: number,
+  ): Array<{ entryId: number; distance: number }> {
+    const map = new Map<number, number>();
+    for (const r of a) {
+      map.set(r.entryId, r.distance);
+    }
+    for (const r of b) {
+      const existing = map.get(r.entryId);
+      if (existing === undefined || r.distance < existing) {
+        map.set(r.entryId, r.distance);
+      }
+    }
+    return Array.from(map.entries())
+      .map(([entryId, distance]) => ({ entryId, distance }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, topK);
   }
 
   /** LanceDB auto-saves, so this is a no-op but maintained for interface compatibility */

@@ -44,20 +44,20 @@ export class SqliteVecStore {
         }
     }
 
-    search(queryEmbedding: number[], topK = 5, entryType?: string): Array<{ entryId: number; distance: number }> {
+    search(queryEmbedding: number[], topK = 5, entryType?: string): Array<{ entryId: number; distance: number; text: string }> {
         try {
             const vec = new Float32Array(queryEmbedding);
             let sql: string;
             let params: any[];
             if (entryType) {
-                sql = "SELECT entry_id, distance FROM vec_entries WHERE embedding MATCH ? AND k = ? AND entry_type = ?";
+                sql = "SELECT entry_id, distance, text FROM vec_entries WHERE embedding MATCH ? AND k = ? AND entry_type = ?";
                 params = [vec, topK, entryType];
             } else {
-                sql = "SELECT entry_id, distance FROM vec_entries WHERE embedding MATCH ? AND k = ?";
+                sql = "SELECT entry_id, distance, text FROM vec_entries WHERE embedding MATCH ? AND k = ?";
                 params = [vec, topK];
             }
             const rows = this.db.prepare(sql).all(...params) as any[];
-            return rows.map(r => ({ entryId: r.entry_id, distance: r.distance }));
+            return rows.map(r => ({ entryId: r.entry_id, distance: r.distance, text: r.text ?? "" }));
         } catch (err) {
             this.logger.warn?.("sqlite-vec search failed:", String(err));
             return [];

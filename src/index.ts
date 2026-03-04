@@ -17,6 +17,7 @@ import type { PluginApi } from "./types";
 // Database
 import { UnifiedDBImpl } from "./db/sqlite";
 import { NativeLanceManager } from "./db/lance-manager";
+import { SqliteVecStore } from "./db/sqlite-vec";
 
 // Embedding
 import { qwenSemanticSearch } from "./embedding/ollama";
@@ -73,11 +74,26 @@ const memoryUnifiedPlugin = {
     };
 
     // ========================================================================
+    // sqlite-vec Vector Store (Phase 1: dual-write alongside LanceDB)
+    // ========================================================================
+    let sqliteVecStore: SqliteVecStore | null = null;
+    try {
+      sqliteVecStore = new SqliteVecStore(udb.db, api.logger);
+      api.logger.info?.(`memory-unified: sqlite-vec store ready (${sqliteVecStore.count()} vectors)`);
+    } catch (vecErr) {
+      api.logger.warn?.('memory-unified: sqlite-vec init failed, continuing without:', String(vecErr));
+    }
+
+    // ========================================================================
     // LanceDB Vector Index
     // ========================================================================
     let lanceManager: NativeLanceManager | null = null;
     try {
       lanceManager = new NativeLanceManager(resolvedDbPath, udb.db, api.logger);
+      // Attach sqlite-vec for dual-write
+      if (sqliteVecStore) {
+        lanceManager.setSqliteVecStore(sqliteVecStore);
+      }
       api.logger.info?.(`memory-unified: LanceDB manager ready (${lanceManager.getCount()} vectors)`);
     } catch (hnswErr) {
       api.logger.warn?.('memory-unified: LanceDB manager init failed, continuing without:', String(hnswErr));

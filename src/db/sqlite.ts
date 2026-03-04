@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import Database from "better-sqlite3";
+import * as sqliteVec from "sqlite-vec";
 import type { UnifiedDB } from "../types";
 import type { EntryType } from "../config";
 
@@ -18,6 +19,7 @@ export class UnifiedDBImpl implements UnifiedDB {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     this.db = new Database(dbPath);
+    sqliteVec.load(this.db);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.initTables();

@@ -9,9 +9,11 @@ import * as path from "node:path";
 import Database from "better-sqlite3";
 import { LanceVectorStore } from "./lancedb";
 import { qwenEmbed } from "../embedding/ollama";
+import type { SqliteVecStore } from "./sqlite-vec";
 
 export class NativeLanceManager {
   private lanceStore: LanceVectorStore;
+  private sqliteVecStore: SqliteVecStore | null = null;
   private insertsSinceSave = 0;
   private db: ReturnType<typeof Database>;
   private logger: { info?(...a: unknown[]): void; warn?(...a: unknown[]): void; error?(...a: unknown[]): void };
@@ -43,6 +45,11 @@ export class NativeLanceManager {
         logger.error?.('memory-unified: LanceDB init failed:', String(err));
         this.ready = false;
       });
+  }
+
+  /** Attach a SqliteVecStore for Phase 1 dual-write */
+  setSqliteVecStore(store: SqliteVecStore): void {
+    this.sqliteVecStore = store;
   }
 
   isReady(): boolean {
@@ -84,6 +91,11 @@ export class NativeLanceManager {
       if (success) {
         this.db.prepare('INSERT OR IGNORE INTO hnsw_meta (entry_id) VALUES (?)').run(entryId);
         this.insertsSinceSave++;
+
+        // Phase 1 dual-write: also store in sqlite-vec
+        if (this.sqliteVecStore) {
+          this.sqliteVecStore.store(entryId, text, embedding, metadata.entry_type);
+        }
       }
 
       return success;

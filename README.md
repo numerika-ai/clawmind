@@ -129,7 +129,11 @@ Add to `openclaw.json`:
 | **Phase 2** | Read from sqlite-vec, LanceDB as fallback | 🔜 Next |
 | **Phase 3** | Remove LanceDB dependency entirely | ⬜ Planned |
 
-**Key fix (2026-03-04):** sqlite-vec vec0 virtual table requires BigInt for INTEGER PRIMARY KEY — standard JavaScript Number is rejected. Fixed in commit 18f2dd2.
+**Fix (2026-03-04):** sqlite-vec vec0 virtual table requires BigInt for INTEGER PRIMARY KEY — standard JavaScript Number is rejected. Fixed in commit 18f2dd2.
+
+**Fix (2026-03-05):** FTS5 skill matching failed for voice messages — keyword extraction picked up WhatsApp metadata (`[Audio]`, `[WhatsApp...]`, `Transcript:`) instead of user's actual text. Two fixes in commit a1ccc77:
+1. **Metadata stripping** — extracts clean text from `Transcript:` suffix before building FTS5 keywords
+2. **Skills table fallback** — added direct LIKE search on `skills.description` and `skills.keywords` (~30 rows, negligible cost) as fallback when FTS5 on `unified_entries` misses
 
 **Test environment:** Hermes VM (OpenClaw agent on loco39) — 7/7 entries dual-written successfully.
 
@@ -141,4 +145,4 @@ Add to `openclaw.json`:
 - [CUDA-SETUP.md](docs/CUDA-SETUP.md) — GPU embedding setup
 
 ---
-*Last edited by Wiki — 2026-03-04 20:36 UTC*
+*Last edited by Wiki — 2026-03-05 11:30 UTC*

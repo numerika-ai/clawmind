@@ -51,7 +51,19 @@ export function createRagInjectionHook(deps: HookDependencies) {
       // STEP 1: FTS5 full-text search for matching SKILLS (priority)
       // ============================================================
       try {
-        const keywords = (prompt.match(/[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}/g) || [])
+        // Strip audio/WhatsApp metadata — extract only user actual text
+        let cleanPrompt = prompt;
+        const transcriptMatch = prompt.match(/Transcript:\s*\n?([\s\S]+?)$/i);
+        if (transcriptMatch) {
+          cleanPrompt = transcriptMatch[1].trim();
+        } else {
+          cleanPrompt = prompt.replace(/\[Audio\][\s\S]*?Transcript:\s*/i, "")
+                              .replace(/\[WhatsApp[^\]]*\]\s*<media:[^>]+>\s*/gi, "")
+                              .replace(/User text:\s*/gi, "")
+                              .trim() || prompt;
+        }
+
+        const keywords = (cleanPrompt.match(/[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}/g) || [])
           .slice(0, 10)
           .join(" OR ");
 
@@ -66,6 +78,25 @@ export function createRagInjectionHook(deps: HookDependencies) {
             ORDER BY rank
             LIMIT 3
           `).all(keywords);
+
+          // LAYER 2: Direct search in skills table (fast fallback, ~30 rows)
+          const skillWords = (cleanPrompt.match(/[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}/g) || []).slice(0, 10);
+          const seenFtsSkills = new Set<string>();
+          for (const r of ftsResults as any[]) {
+            const n = (r.hnsw_key || "").replace("skill-full:", "").replace("skill:", "");
+            seenFtsSkills.add(n);
+          }
+          try {
+            const likeOr = skillWords.map((w: string) => `(s.description LIKE '%${w.replace(/'/g, "")}%' OR s.keywords LIKE '%${w.replace(/'/g, "")}%')`).join(" OR ");
+            if (likeOr) {
+              const skillRows = udb.db.prepare(`SELECT s.name, s.description, s.procedure, length(s.procedure) as proc_len FROM skills s WHERE ${likeOr} ORDER BY s.last_used DESC NULLS LAST LIMIT 3`).all() as any[];
+              for (const s of skillRows) {
+                if (!seenFtsSkills.has(s.name)) {
+                  (ftsResults as any[]).push({ hnsw_key: `skill-full:${s.name}`, content: s.procedure, source_path: null, summary: s.description, content_len: s.proc_len || 0 });
+                }
+              }
+            }
+          } catch {}
 
           for (const r of ftsResults as any[]) {
             const name = (r.hnsw_key || "").replace("skill-full:", "").replace("skill:", "");

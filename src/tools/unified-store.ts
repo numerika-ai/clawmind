@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import type { ToolDef, ToolResult, RufloHNSW, UnifiedDB } from "../types";
 import type { EntryType } from "../config";
-import { autoTag, summarize } from "../utils/helpers";
+import { autoTag, summarize, extractAgentFromSessionKey } from "../utils/helpers";
 
 interface NativeHnswManager {
   isReady(): boolean;
@@ -30,7 +30,7 @@ export function createUnifiedStoreTool(
       const entryType = (params.type as EntryType) ?? "history";
       const userTags = params.tags as string | undefined;
       const sourcePath = params.source_path as string | undefined;
-      const agentId = (params.agent_id as string | undefined) ?? (globalThis as any).__openclawAgentId ?? "unknown";
+      const agentId = (params.agent_id as string | undefined) ?? (globalThis as any).__openclawAgentId ?? extractAgentFromSessionKey((globalThis as any).__openclawSessionKey) ?? "main";
 
       const tags = userTags ? userTags.split(",").map(t => t.trim()) : autoTag(content);
       const summary = summarize(content);

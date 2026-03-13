@@ -133,3 +133,13 @@ export function isDecision(text: string): boolean {
 export function isResolution(text: string): boolean {
   return /\u2705|done|gotowe|zrobione|zako\u0144czon|wdro\u017con|naprawion/i.test(text);
 }
+
+/**
+ * Extract agent ID from an OpenClaw session key pattern like "agent:AGENT_ID:..."
+ * Returns undefined if the pattern doesn't match.
+ */
+export function extractAgentFromSessionKey(sessionKey: string | undefined | null): string | undefined {
+  if (!sessionKey) return undefined;
+  const match = sessionKey.match(/^agent:([^:]+)/);
+  return match?.[1] || undefined;
+}

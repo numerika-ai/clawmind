@@ -1,15 +1,19 @@
 import type { PluginApi, UnifiedDB, RufloHNSW } from "../types";
 import type { UnifiedMemoryConfig } from "../config";
+import type { MemoryBankConfig } from "../memory-bank/types";
 import { autoTag } from "../utils/helpers";
-import { 
-  extractKeywords, 
-  extractTopic, 
-  extractConversationTags, 
+import {
+  extractKeywords,
+  extractTopic,
+  extractConversationTags,
   generateThreadId,
   isDecision,
   isActionRequest,
-  isResolution
+  isResolution,
+  extractAgentFromSessionKey
 } from "../utils/helpers";
+import { extractFacts } from "../memory-bank/extractor";
+import { consolidateFact } from "../memory-bank/consolidator";
 
 // State variables shared across hooks
 interface MemoryState {
@@ -31,6 +35,7 @@ interface HookDependencies {
   lanceManager: NativeLanceManager | null;
   cfg: UnifiedMemoryConfig;
   memoryState: MemoryState;
+  memoryBankConfig?: MemoryBankConfig;
 }
 
 /**
@@ -61,7 +66,7 @@ export function createToolCallLogHook(deps: HookDependencies) {
       const summary = `${toolName}(${status}): ${paramsPreview.slice(0, 80)}`;
       const hnswKey = `tool:${toolName}:${Date.now()}`;
 
-      const agentId = (event.agentId ?? event.agent_id ?? (globalThis as any).__openclawAgentId ?? "unknown") as string;
+      const agentId = (event.agentId ?? event.agent_id ?? (globalThis as any).__openclawAgentId ?? extractAgentFromSessionKey(event.sessionKey as string | undefined) ?? "main") as string;
       const toolEntryId = udb.storeEntry({
         entryType: "tool",
         tags: tags.join(","),
@@ -113,7 +118,7 @@ export function createToolCallLogHook(deps: HookDependencies) {
  * Creates the agent end hook for agent_end
  */
 export function createAgentEndHook(deps: HookDependencies) {
-  const { udb, ruflo, cfg, memoryState } = deps;
+  const { udb, ruflo, cfg, memoryState, memoryBankConfig } = deps;
 
   return async function(api: PluginApi, event: Record<string, unknown>) {
     // Always clear dynamic tool policy — prevent stale policies across turns
@@ -346,6 +351,41 @@ export function createAgentEndHook(deps: HookDependencies) {
         api.logger.warn?.('memory-unified: conversation tracking error:', String(convErr));
       }
 
+      // ============================================================
+      // MEMORY BANK EXTRACTION (fire and forget)
+      // ============================================================
+      if (memoryBankConfig?.enabled) {
+        try {
+          const mbPrompt = memoryState.turnPrompt || "";
+          const mbResponse = responsePreview || "";
+          const conversationText = `User: ${mbPrompt}\nAssistant: ${mbResponse}`;
+
+          // Skip if too short or cron/heartbeat
+          const isCron = /^\s*\[?cron:|HEARTBEAT_OK|\[Subagent Context\]|Auto-handoff check/i.test(mbPrompt);
+          if (!isCron && conversationText.length >= memoryBankConfig.minConversationLength) {
+            // Fire and forget — don't block agent_end
+            extractFacts(conversationText, memoryBankConfig)
+              .then(async (facts) => {
+                for (const fact of facts) {
+                  try {
+                    await consolidateFact(fact, udb.db, memoryBankConfig, deps.lanceManager, api.logger);
+                  } catch (consErr) {
+                    api.logger.warn?.("memory-bank: consolidation error:", String(consErr).slice(0, 100));
+                  }
+                }
+                if (facts.length > 0) {
+                  api.logger.info?.(`memory-bank: extracted ${facts.length} facts from conversation`);
+                }
+              })
+              .catch((exErr) => {
+                api.logger.warn?.("memory-bank: extraction error:", String(exErr).slice(0, 100));
+              });
+          }
+        } catch (mbErr) {
+          api.logger.warn?.("memory-bank: memory bank error:", String(mbErr).slice(0, 100));
+        }
+      }
+
       // Trajectory end (Ruflo SONA)
       if (memoryState.activeTrajectoryId && ruflo) {
         try {
@@ -367,6 +407,7 @@ export function createAgentEndHook(deps: HookDependencies) {
       memoryState.turnPrompt = null;
       memoryState.agentId = null;
       (globalThis as any).__openclawAgentId = undefined;
+      (globalThis as any).__openclawSessionKey = undefined;
     }
   };
 }

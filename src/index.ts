@@ -22,6 +22,10 @@ import { SqliteVecStore } from "./db/sqlite-vec";
 // Embedding
 import { qwenSemanticSearch } from "./embedding/ollama";
 
+// Memory Bank
+import { DEFAULT_TOPICS } from "./memory-bank/topics";
+import type { MemoryBankConfig } from "./memory-bank/types";
+
 // Hooks
 import { createRagInjectionHook } from "./hooks/rag-injection";
 import { createToolCallLogHook, createAgentEndHook } from "./hooks/on-turn-end";
@@ -100,6 +104,19 @@ const memoryUnifiedPlugin = {
       api.logger.warn?.('memory-unified: LanceDB manager init failed, continuing without:', String(hnswErr));
     }
 
+    // ========================================================================
+    // Memory Bank: seed default topics
+    // ========================================================================
+    const memoryBankConfig: MemoryBankConfig | undefined = cfg.memoryBank;
+    if (memoryBankConfig?.enabled) {
+      try {
+        udb.seedTopics(DEFAULT_TOPICS);
+        api.logger.info?.("memory-unified: memory bank topics seeded");
+      } catch (seedErr) {
+        api.logger.warn?.("memory-unified: topic seed failed:", String(seedErr));
+      }
+    }
+
     api.logger.info?.(`memory-unified: initialized (db: ${resolvedDbPath})`);
 
     // ========================================================================
@@ -114,6 +131,7 @@ const memoryUnifiedPlugin = {
         memoryState,
         qwenSemanticSearch,
         extractKeywords,
+        memoryBankConfig,
       });
 
       api.on("before_agent_start", async (event) => {
@@ -148,6 +166,7 @@ const memoryUnifiedPlugin = {
         lanceManager,
         cfg,
         memoryState,
+        memoryBankConfig,
       });
 
       api.on("agent_end", async (event) => {

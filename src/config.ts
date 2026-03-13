@@ -3,7 +3,7 @@
  */
 
 const DEFAULT_DB_PATH = "/home/hermes/.openclaw/workspace/skill-memory.db";
-const ALLOWED_KEYS = ["dbPath", "ragSlim", "logToolCalls", "trajectoryTracking", "ragTopK"];
+const ALLOWED_KEYS = ["dbPath", "ragSlim", "logToolCalls", "trajectoryTracking", "ragTopK", "memoryBank"];
 
 export interface UnifiedMemoryConfig {
   dbPath: string;
@@ -11,6 +11,15 @@ export interface UnifiedMemoryConfig {
   logToolCalls: boolean;
   trajectoryTracking: boolean;
   ragTopK: number;
+  memoryBank?: {
+    enabled: boolean;
+    extractionModel: string;
+    extractionUrl: string;
+    minConversationLength: number;
+    consolidationThreshold: number;
+    maxFactsPerTurn: number;
+    ragTopK: number;
+  };
 }
 
 export const ENTRY_TYPES = [
@@ -50,12 +59,39 @@ export const unifiedConfigSchema = {
     const ragTopK = typeof cfg.ragTopK === "number" ? Math.floor(cfg.ragTopK) : 5;
     if (ragTopK < 1 || ragTopK > 20) throw new Error("ragTopK must be 1-20");
 
+    // Parse memoryBank config with defaults
+    let memoryBank: UnifiedMemoryConfig["memoryBank"] = undefined;
+    if (cfg.memoryBank !== undefined) {
+      const mb = (cfg.memoryBank && typeof cfg.memoryBank === "object" ? cfg.memoryBank : {}) as Record<string, unknown>;
+      memoryBank = {
+        enabled: mb.enabled !== false,
+        extractionModel: typeof mb.extractionModel === "string" ? mb.extractionModel : "qwen3:32b",
+        extractionUrl: typeof mb.extractionUrl === "string" ? mb.extractionUrl : "http://192.168.1.80:11434/v1/chat/completions",
+        minConversationLength: typeof mb.minConversationLength === "number" ? mb.minConversationLength : 0,
+        consolidationThreshold: typeof mb.consolidationThreshold === "number" ? mb.consolidationThreshold : 0.85,
+        maxFactsPerTurn: typeof mb.maxFactsPerTurn === "number" ? mb.maxFactsPerTurn : 10,
+        ragTopK: typeof mb.ragTopK === "number" ? mb.ragTopK : 5,
+      };
+    } else {
+      // Default: enabled
+      memoryBank = {
+        enabled: true,
+        extractionModel: "qwen3:32b",
+        extractionUrl: "http://192.168.1.80:11434/v1/chat/completions",
+        minConversationLength: 0,
+        consolidationThreshold: 0.85,
+        maxFactsPerTurn: 10,
+        ragTopK: 5,
+      };
+    }
+
     return {
       dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
       ragSlim: cfg.ragSlim !== false,
       logToolCalls: cfg.logToolCalls !== false,
       trajectoryTracking: cfg.trajectoryTracking !== false,
       ragTopK,
+      memoryBank,
     };
   },
 };

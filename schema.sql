@@ -96,6 +96,49 @@ CREATE TABLE IF NOT EXISTS unified_entries (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Memory Bank: facts, revisions, topics
+CREATE TABLE IF NOT EXISTS memory_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT NOT NULL,
+    fact TEXT NOT NULL,
+    confidence REAL DEFAULT 0.8,
+    source_type TEXT DEFAULT 'conversation',
+    source_session TEXT,
+    source_summary TEXT,
+    agent_id TEXT DEFAULT 'main',
+    ttl_days INTEGER DEFAULT NULL,
+    access_count INTEGER DEFAULT 0,
+    last_accessed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expired_at TIMESTAMP DEFAULT NULL,
+    hnsw_key TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_facts_topic ON memory_facts(topic);
+CREATE INDEX IF NOT EXISTS idx_facts_agent ON memory_facts(agent_id);
+CREATE INDEX IF NOT EXISTS idx_facts_confidence ON memory_facts(confidence);
+
+CREATE TABLE IF NOT EXISTS memory_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_id INTEGER NOT NULL REFERENCES memory_facts(id),
+    revision_type TEXT CHECK(revision_type IN ('created','updated','merged','expired','manual_edit')) NOT NULL,
+    old_content TEXT,
+    new_content TEXT,
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS memory_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    description TEXT,
+    extraction_prompt TEXT,
+    ttl_days INTEGER DEFAULT NULL,
+    priority INTEGER DEFAULT 5,
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
 CREATE INDEX IF NOT EXISTS idx_skills_category ON skills(category);

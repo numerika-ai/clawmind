@@ -190,6 +190,51 @@ CREATE INDEX IF NOT EXISTS idx_unified_agent ON unified_entries(agent_id);
         this.db.exec("INSERT INTO unified_fts(unified_fts) VALUES('rebuild')");
       }
     } catch {}
+
+    // Memory Bank tables
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        topic TEXT NOT NULL,
+        fact TEXT NOT NULL,
+        confidence REAL DEFAULT 0.8,
+        source_type TEXT DEFAULT 'conversation',
+        source_session TEXT,
+        source_summary TEXT,
+        agent_id TEXT DEFAULT 'main',
+        ttl_days INTEGER DEFAULT NULL,
+        access_count INTEGER DEFAULT 0,
+        last_accessed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expired_at TIMESTAMP DEFAULT NULL,
+        hnsw_key TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_facts_topic ON memory_facts(topic);
+      CREATE INDEX IF NOT EXISTS idx_facts_agent ON memory_facts(agent_id);
+      CREATE INDEX IF NOT EXISTS idx_facts_confidence ON memory_facts(confidence);
+
+      CREATE TABLE IF NOT EXISTS memory_revisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fact_id INTEGER NOT NULL REFERENCES memory_facts(id),
+        revision_type TEXT CHECK(revision_type IN ('created','updated','merged','expired','manual_edit')) NOT NULL,
+        old_content TEXT,
+        new_content TEXT,
+        reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_topics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        description TEXT,
+        extraction_prompt TEXT,
+        ttl_days INTEGER DEFAULT NULL,
+        priority INTEGER DEFAULT 5,
+        enabled INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
   }
 
   // --- Unified entries ---
@@ -272,5 +317,70 @@ CREATE INDEX IF NOT EXISTS idx_unified_agent ON unified_entries(agent_id);
       return this.searchEntries(entryType, limit, agentId);
     }
   }
+  // --- Memory Bank ---
+  seedTopics(topics: Array<{ name: string; description: string; ttl_days: number | null; priority: number }>): void {
+    const stmt = this.db.prepare(
+      "INSERT OR IGNORE INTO memory_topics (name, description, ttl_days, priority) VALUES (?, ?, ?, ?)"
+    );
+    for (const t of topics) {
+      stmt.run(t.name, t.description, t.ttl_days, t.priority);
+    }
+  }
+
+  getTopics(): any[] {
+    return this.db.prepare("SELECT * FROM memory_topics WHERE enabled = 1 ORDER BY priority DESC").all();
+  }
+
+  storeFact(params: {
+    topic: string;
+    fact: string;
+    confidence?: number;
+    sourceType?: string;
+    sourceSession?: string;
+    sourceSummary?: string;
+    agentId?: string;
+    hnswKey?: string;
+  }): number {
+    const r = this.db.prepare(`
+      INSERT INTO memory_facts (topic, fact, confidence, source_type, source_session, source_summary, agent_id, hnsw_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      params.topic, params.fact, params.confidence ?? 0.8,
+      params.sourceType ?? "conversation", params.sourceSession ?? null,
+      params.sourceSummary ?? null, params.agentId ?? "main", params.hnswKey ?? null
+    );
+    return r.lastInsertRowid as number;
+  }
+
+  updateFact(id: number, fact: string, confidence?: number): void {
+    if (confidence !== undefined) {
+      this.db.prepare("UPDATE memory_facts SET fact = ?, confidence = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .run(fact, confidence, id);
+    } else {
+      this.db.prepare("UPDATE memory_facts SET fact = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .run(fact, id);
+    }
+  }
+
+  searchFacts(topic?: string, limit = 20): any[] {
+    if (topic) {
+      return this.db.prepare("SELECT * FROM memory_facts WHERE topic = ? AND expired_at IS NULL ORDER BY confidence DESC, updated_at DESC LIMIT ?").all(topic, limit);
+    }
+    return this.db.prepare("SELECT * FROM memory_facts WHERE expired_at IS NULL ORDER BY confidence DESC, updated_at DESC LIMIT ?").all(limit);
+  }
+
+  getFactsByTopic(topic: string): any[] {
+    return this.db.prepare("SELECT * FROM memory_facts WHERE topic = ? AND expired_at IS NULL ORDER BY confidence DESC").all(topic);
+  }
+
+  expireFacts(): number {
+    const result = this.db.prepare(`
+      UPDATE memory_facts SET expired_at = CURRENT_TIMESTAMP
+      WHERE expired_at IS NULL AND ttl_days IS NOT NULL
+      AND julianday('now') - julianday(created_at) > ttl_days
+    `).run();
+    return result.changes;
+  }
+
   close(): void { this.db.close(); }
 }

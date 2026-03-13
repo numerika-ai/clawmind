@@ -1,5 +1,8 @@
 import type { PluginApi, UnifiedDB, RufloHNSW } from "../types";
 import type { UnifiedMemoryConfig } from "../config";
+import type { MemoryBankConfig, MemoryFact } from "../memory-bank/types";
+import { qwenEmbed, cosineSim } from "../embedding/ollama";
+import { extractAgentFromSessionKey } from "../utils/helpers";
 
 // State variables that need to be shared across hooks
 interface MemoryState {
@@ -31,6 +34,7 @@ interface HookDependencies {
   memoryState: MemoryState;
   qwenSemanticSearch: QwenSearchFunction;
   extractKeywords: ExtractKeywordsFunction;
+  memoryBankConfig?: MemoryBankConfig;
 }
 
 /**
@@ -45,9 +49,10 @@ export function createRagInjectionHook(deps: HookDependencies) {
     if (!prompt || prompt.length < 5) return;
 
     // Capture agent_id from event context and expose globally for tools
-    const agentId = (event.agentId ?? event.agent_id ?? "unknown") as string;
+    const agentId = (event.agentId ?? event.agent_id ?? extractAgentFromSessionKey(event.sessionKey as string | undefined) ?? "main") as string;
     memoryState.agentId = agentId;
     (globalThis as any).__openclawAgentId = agentId;
+    (globalThis as any).__openclawSessionKey = event.sessionKey as string | undefined;
 
     try {
       const slimLines: string[] = [];
@@ -272,6 +277,50 @@ export function createRagInjectionHook(deps: HookDependencies) {
         }
       } catch (convCtxErr) {
         api.logger.warn?.('memory-unified: conversation context error:', String(convCtxErr));
+      }
+
+      // ============================================================
+      // STEP 6: Memory Bank facts (semantic search)
+      // ============================================================
+      if (deps.memoryBankConfig?.enabled) {
+        try {
+          const mbConfig = deps.memoryBankConfig;
+          const queryEmb = await qwenEmbed(prompt);
+          if (queryEmb) {
+            const activeFacts = udb.db.prepare(
+              "SELECT id, topic, fact, confidence FROM memory_facts WHERE expired_at IS NULL AND confidence > 0.3 ORDER BY confidence DESC LIMIT 50"
+            ).all() as Array<Pick<MemoryFact, "id" | "topic" | "fact" | "confidence">>;
+
+            const scored: Array<{ id: number; topic: string; fact: string; confidence: number; similarity: number }> = [];
+            for (const f of activeFacts) {
+              const fEmb = await qwenEmbed(f.fact);
+              if (!fEmb) continue;
+              const sim = cosineSim(queryEmb, fEmb);
+              if (sim > 0.35) {
+                scored.push({ ...f, similarity: sim });
+              }
+            }
+
+            scored.sort((a, b) => b.similarity - a.similarity);
+            const topFacts = scored.slice(0, mbConfig.ragTopK);
+
+            if (topFacts.length > 0) {
+              slimLines.push("[memory bank]");
+              for (const f of topFacts) {
+                slimLines.push(`  [${f.topic}] ${f.fact} (${(f.confidence * 100).toFixed(0)}%)`);
+                // Update access stats
+                try {
+                  udb.db.prepare(
+                    "UPDATE memory_facts SET access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP WHERE id = ?"
+                  ).run(f.id);
+                } catch {}
+              }
+              api.logger.info?.(`memory-bank: injected ${topFacts.length} facts into RAG`);
+            }
+          }
+        } catch (mbErr) {
+          api.logger.warn?.("memory-bank: RAG injection error:", String(mbErr).slice(0, 100));
+        }
       }
 
       if (slimLines.length === 0 && !matchedProcedure) return;

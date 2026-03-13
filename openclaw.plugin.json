@@ -38,7 +38,22 @@
       "ragSlim": { "type": "boolean" },
       "logToolCalls": { "type": "boolean" },
       "logToolWhitelist": { "type": "array", "items": { "type": "string" } },
-      "ragTopK": { "type": "number" }
+      "trajectoryTracking": { "type": "boolean" },
+      "ragTopK": { "type": "number" },
+      "memoryBank": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "extractionModel": { "type": "string" },
+          "extractionUrl": { "type": "string" },
+          "extractionApiKey": { "type": "string" },
+          "minConversationLength": { "type": "number" },
+          "consolidationThreshold": { "type": "number" },
+          "maxFactsPerTurn": { "type": "number" },
+          "ragTopK": { "type": "number" }
+        }
+      }
     }
   }
 }

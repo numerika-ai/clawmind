@@ -44,10 +44,32 @@ interface HookDependencies {
 }
 
 /**
+ * Tools worth logging — everything else (exec, read, write, process, web_fetch) is noise.
+ * These tools carry decision/routing/config information that improves RAG quality.
+ */
+const TOOL_LOG_WHITELIST = new Set([
+  "sessions_spawn",   // MoE routing decisions
+  "message",          // communication decisions
+  "gateway",          // config changes
+  "cron",             // scheduled task changes
+  "unified_store",    // explicit memory stores
+]);
+
+/**
  * Creates the tool call logging hook for after_tool_call
  */
 export function createToolCallLogHook(deps: HookDependencies) {
-  const { udb, ruflo, lanceManager, memoryState } = deps;
+  const { udb, ruflo, lanceManager, cfg, memoryState } = deps;
+
+  // Resolve filter: config can override with "all", "none", or string[] of tool names
+  const filterCfg = (cfg as any).logToolCallsFilter;
+  const useWhitelist = filterCfg === "all" ? false
+    : filterCfg === "none" ? true  // "none" means log nothing extra
+    : Array.isArray(filterCfg) ? false
+    : true; // default: use whitelist
+  const customFilter: Set<string> | null = Array.isArray(filterCfg)
+    ? new Set(filterCfg as string[])
+    : null;
 
   return async function(api: PluginApi, event: Record<string, unknown>) {
     try {
@@ -61,9 +83,14 @@ export function createToolCallLogHook(deps: HookDependencies) {
       if (toolName.startsWith("skill_") || toolName.startsWith("unified_") || toolName === "artifact_register") return;
       if (toolName === "unknown") return;
 
-      const paramsPreview = params ? JSON.stringify(params).slice(0, 500) : "";
+      // Smart filtering: only log whitelisted tools (95% noise reduction)
+      if (filterCfg === "none") return;
+      if (customFilter && !customFilter.has(toolName)) return;
+      if (useWhitelist && !TOOL_LOG_WHITELIST.has(toolName)) return;
+
+      const paramsPreview = params ? JSON.stringify(params).slice(0, 300) : "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result ?? "");
-      const resultPreview = error ? `ERROR: ${error}`.slice(0, 300) : resultStr.slice(0, 300);
+      const resultPreview = error ? `ERROR: ${error}`.slice(0, 200) : resultStr.slice(0, 200);
       const status = error ? "error" : "success";
 
       // Store in SQLite unified_entries
@@ -80,11 +107,6 @@ export function createToolCallLogHook(deps: HookDependencies) {
         hnswKey,
         agentId,
       });
-
-      // Store in HNSW (fire and forget, don't block agent)
-      if (ruflo) {
-        ruflo.store(hnswKey, { tool: toolName, summary, status, tags }, { tags: [toolName, ...tags], namespace: "unified" }).catch(() => {});
-      }
 
       // Native HNSW indexing (fire and forget, don't block agent)
       if (lanceManager?.isReady()) {

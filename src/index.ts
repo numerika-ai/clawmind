@@ -24,7 +24,7 @@ import { qwenSemanticSearch } from "./embedding/nemotron";
 
 // Memory Bank
 import { DEFAULT_TOPICS } from "./memory-bank/topics";
-import { runMaintenance } from "./memory-bank/maintenance";
+import { runMaintenance, runDataCleanup, runPeriodicMaintenance } from "./memory-bank/maintenance";
 import { backfillFactEmbeddings } from "./memory-bank/backfill";
 import type { MemoryBankConfig } from "./memory-bank/types";
 
@@ -130,6 +130,24 @@ const memoryUnifiedPlugin = {
       }
     } catch (cleanupErr) {
       api.logger.warn?.("memory-unified: phantom conversation cleanup failed:", String(cleanupErr));
+    }
+
+    // One-time data cleanup: remove tool entries + staging blobs + vacuum
+    // Runs idempotently — safe on subsequent startups (nothing to delete after first run)
+    try {
+      const cleanupStats = runDataCleanup(udb.db, api.logger);
+      if (cleanupStats.toolEntriesDeleted > 0 || cleanupStats.stagingCleared > 0) {
+        api.logger.info?.(`memory-unified: cleanup — tool entries=${cleanupStats.toolEntriesDeleted}, staging=${cleanupStats.stagingCleared}, vacuumed=${cleanupStats.vacuumed}`);
+      }
+    } catch (cleanupErr) {
+      api.logger.warn?.("memory-unified: data cleanup failed:", String(cleanupErr));
+    }
+
+    // Run periodic maintenance (TTL, decay, purge old tools, archive stale convs)
+    try {
+      runPeriodicMaintenance(udb.db, api.logger, resolvedDbPath);
+    } catch (pmErr) {
+      api.logger.warn?.("memory-unified: periodic maintenance failed:", String(pmErr));
     }
 
     api.logger.info?.(`memory-unified: initialized (db: ${resolvedDbPath})`);

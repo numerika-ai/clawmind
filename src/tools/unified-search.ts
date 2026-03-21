@@ -26,11 +26,14 @@ export function createUnifiedSearchTool(udb: UnifiedDB, lanceManager: VectorMana
       // Semantic vector search via sqlite-vec + Nemotron embeddings
       let vectorLines: string[] = [];
       let vectorCount = 0;
+      const allHitIds: number[] = [];
+
       if (lanceManager?.isReady()) {
         try {
           const vectorResults = await lanceManager.search(query, limit);
           vectorCount = vectorResults.length;
           for (const r of vectorResults) {
+            allHitIds.push(r.entryId);
             // Enrich with text from SQLite by entryId
             const entry = udb.getEntryById?.(r.entryId);
             const text = entry?.summary || entry?.content?.slice(0, 120) || `entry#${r.entryId}`;
@@ -38,6 +41,18 @@ export function createUnifiedSearchTool(udb: UnifiedDB, lanceManager: VectorMana
             vectorLines.push(`- [${similarity}%] [${entry?.entry_type || "?"}] ${text}`);
           }
         } catch {}
+      }
+
+      // Track access_count for returned results
+      for (const e of sqlResults) { if (e.id) allHitIds.push(e.id); }
+      if (allHitIds.length > 0) {
+        try {
+          const ids = [...new Set(allHitIds)];
+          const placeholders = ids.map(() => "?").join(",");
+          (udb as any).db.prepare(
+            `UPDATE unified_entries SET access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`
+          ).run(...ids);
+        } catch {} // non-critical
       }
 
       const lines = [

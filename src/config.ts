@@ -3,12 +3,13 @@
  */
 
 const DEFAULT_DB_PATH = "skill-memory.db";
-const ALLOWED_KEYS = ["dbPath", "ragSlim", "logToolCalls", "trajectoryTracking", "ragTopK", "memoryBank", "embeddingDim", "embeddingModel", "rerankUrl", "rerankEnabled"];
+const ALLOWED_KEYS = ["dbPath", "ragSlim", "logToolCalls", "logToolCallsFilter", "trajectoryTracking", "ragTopK", "memoryBank", "embeddingDim", "embeddingModel", "rerankUrl", "rerankEnabled"];
 
 export interface UnifiedMemoryConfig {
   dbPath: string;
   ragSlim: boolean;
   logToolCalls: boolean;
+  logToolCallsFilter: "all" | "none" | "whitelist" | string[];  // "all" = log everything, "none" = log nothing, "whitelist" = built-in, string[] = custom
   trajectoryTracking: boolean;
   ragTopK: number;
   embeddingDim: number;
@@ -54,6 +55,7 @@ export const unifiedConfigSchema = {
         dbPath: DEFAULT_DB_PATH,
         ragSlim: true,
         logToolCalls: true,
+        logToolCallsFilter: "whitelist",
         trajectoryTracking: true,
         ragTopK: 5,
         embeddingDim: 4096,
@@ -95,10 +97,19 @@ export const unifiedConfigSchema = {
       };
     }
 
+    // Parse logToolCallsFilter: "all", "none", string[], or default "whitelist" (uses built-in whitelist)
+    let logToolCallsFilter: "all" | "none" | string[] = "whitelist" as any;
+    if (cfg.logToolCallsFilter === "all" || cfg.logToolCallsFilter === "none") {
+      logToolCallsFilter = cfg.logToolCallsFilter;
+    } else if (Array.isArray(cfg.logToolCallsFilter)) {
+      logToolCallsFilter = cfg.logToolCallsFilter as string[];
+    }
+
     return {
       dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
       ragSlim: cfg.ragSlim !== false,
       logToolCalls: cfg.logToolCalls !== false,
+      logToolCallsFilter,
       trajectoryTracking: cfg.trajectoryTracking !== false,
       ragTopK,
       embeddingDim: typeof cfg.embeddingDim === "number" ? cfg.embeddingDim : 4096,

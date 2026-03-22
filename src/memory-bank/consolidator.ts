@@ -1,16 +1,13 @@
 /**
  * Memory Bank consolidator — deduplicates, merges, and detects contradictions
- * using semantic similarity + LLM verification
+ * using semantic similarity + LLM verification.
+ *
+ * Now uses DatabasePort (async) for backend-agnostic DB access.
  */
 
-import type { Database } from "better-sqlite3";
-import { embed, cosineSim, embeddingToBuffer } from "../embedding/nemotron";
-import type { ExtractedFact, ConsolidationResult, MemoryBankConfig, MemoryFact } from "./types";
-
-interface FactEmbeddingStore {
-  storeFactEmbedding(factId: number, embeddingBuf: Buffer): void;
-  searchFactsByVector?(queryEmbeddingBuf: Buffer, topK: number, scope?: string): Array<{ factId: number; distance: number; topic: string; fact: string; confidence: number }>;
-}
+import { embed, cosineSim } from "../embedding/nemotron";
+import type { DatabasePort } from "../db/port";
+import type { ExtractedFact, ConsolidationResult, MemoryBankConfig } from "./types";
 
 /**
  * Ask the extraction LLM whether two facts contradict each other.
@@ -69,53 +66,45 @@ Answer:`;
 
 export async function consolidateFact(
   newFact: ExtractedFact,
-  db: Database,
+  port: DatabasePort,
   config: MemoryBankConfig,
   _unused: unknown,
   logger: { info?(...args: unknown[]): void; warn?(...args: unknown[]): void },
   scope?: string,
-  embeddingStore?: FactEmbeddingStore | null,
 ): Promise<ConsolidationResult> {
-  // Embed the new fact using Nemotron (or legacy Qwen)
+  // Embed the new fact using Qwen3
   const newEmb = await embed(newFact.fact, "passage");
 
-  // Helper to store embedding in sqlite-vec
-  const storeVec = (factId: number, emb: number[]) => {
-    if (embeddingStore) {
-      try { embeddingStore.storeFactEmbedding(factId, embeddingToBuffer(emb)); } catch {}
-    }
+  // Helper to store embedding via port
+  const storeVec = async (factId: number, emb: number[]) => {
+    try { await port.storeFactEmbedding(factId, emb); } catch {}
   };
 
   // If embedding fails, just create a new fact without vector dedup
   if (!newEmb) {
-    const factId = insertFact(db, newFact, scope);
-    logRevision(db, factId, "created", null, newFact.fact, "embedding unavailable");
+    const factId = await insertFact(port, newFact, scope);
+    await logRevision(port, factId, "created", null, newFact.fact, "embedding unavailable");
     return { action: "created", factId, similarity: 0 };
   }
 
-  // Vector-first: use pre-embedded facts in sqlite-vec instead of O(n²) per-fact embedding
+  // Vector-first: use pre-embedded facts via port
   let bestSim = 0;
-  let bestMatch: Pick<MemoryFact, "id" | "fact" | "confidence" | "hnsw_key"> | null = null;
+  let bestMatch: { id: number; fact: string; confidence: number; hnsw_key?: string } | null = null;
 
-  if (embeddingStore?.searchFactsByVector) {
-    // Single vector query — replaces N embed calls with 1 sqlite-vec KNN search
-    const vecResults = embeddingStore.searchFactsByVector(embeddingToBuffer(newEmb), 5, scope);
+  try {
+    const vecResults = await port.searchFactsByVector(newEmb, 5, scope);
     for (const vr of vecResults) {
-      // Only consider facts in the same topic
       if (vr.topic !== newFact.topic) continue;
-      const sim = 1 - vr.distance; // cosine distance → similarity
+      const sim = 1 - vr.distance;
       if (sim > bestSim) {
         bestSim = sim;
-        const factRow = db.prepare("SELECT id, fact, confidence, hnsw_key FROM memory_facts WHERE id = ?").get(vr.factId) as any;
-        if (factRow) bestMatch = factRow;
+        const rows = await port.queryFacts({ id: vr.factId });
+        if (rows[0]) bestMatch = rows[0];
       }
     }
-  } else {
-    // Fallback: O(n) per-fact embedding (when sqlite-vec not available)
-    const existing = db.prepare(
-      "SELECT id, fact, confidence, hnsw_key FROM memory_facts WHERE topic = ? AND status = 'active' ORDER BY confidence DESC LIMIT 50"
-    ).all(newFact.topic) as Array<Pick<MemoryFact, "id" | "fact" | "confidence" | "hnsw_key">>;
-
+  } catch {
+    // Vector search unavailable — fallback to O(n) per-fact embedding
+    const existing = await port.queryFacts({ topic: newFact.topic, status: "active", limit: 50 });
     for (const ex of existing) {
       const exEmb = await embed(ex.fact, "passage");
       if (!exEmb) continue;
@@ -131,9 +120,8 @@ export async function consolidateFact(
   if (bestMatch && bestSim > 0.95) {
     // Near-duplicate: boost confidence
     const newConf = Math.min(1.0, bestMatch.confidence + 0.05);
-    db.prepare("UPDATE memory_facts SET confidence = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .run(newConf, bestMatch.id);
-    logRevision(db, bestMatch.id, "merged", bestMatch.fact, bestMatch.fact, `confidence boost ${bestMatch.confidence.toFixed(2)} -> ${newConf.toFixed(2)} (sim=${bestSim.toFixed(3)})`);
+    await port.updateFact(bestMatch.id, { confidence: newConf });
+    await logRevision(port, bestMatch.id, "merged", bestMatch.fact, bestMatch.fact, `confidence boost ${bestMatch.confidence.toFixed(2)} -> ${newConf.toFixed(2)} (sim=${bestSim.toFixed(3)})`);
     logger.info?.(`memory-bank: BOOST fact #${bestMatch.id} (sim=${bestSim.toFixed(3)}, conf=${newConf.toFixed(2)})`);
     return { action: "boosted", factId: bestMatch.id, similarity: bestSim };
   }
@@ -141,11 +129,9 @@ export async function consolidateFact(
   if (bestMatch && bestSim >= 0.90) {
     // Similar: update content
     const oldContent = bestMatch.fact;
-    db.prepare("UPDATE memory_facts SET fact = ?, confidence = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .run(newFact.fact, Math.max(bestMatch.confidence, newFact.confidence), bestMatch.id);
-    logRevision(db, bestMatch.id, "updated", oldContent, newFact.fact, `content update (sim=${bestSim.toFixed(3)})`);
-    // Re-embed updated fact
-    storeVec(bestMatch.id, newEmb);
+    await port.updateFact(bestMatch.id, { fact: newFact.fact, confidence: Math.max(bestMatch.confidence, newFact.confidence) });
+    await logRevision(port, bestMatch.id, "updated", oldContent, newFact.fact, `content update (sim=${bestSim.toFixed(3)})`);
+    await storeVec(bestMatch.id, newEmb);
     logger.info?.(`memory-bank: UPDATE fact #${bestMatch.id} (sim=${bestSim.toFixed(3)})`);
     return { action: "updated", factId: bestMatch.id, similarity: bestSim };
   }
@@ -155,53 +141,50 @@ export async function consolidateFact(
     const { contradicts, reason } = await checkContradiction(bestMatch.fact, newFact.fact, config);
 
     if (contradicts) {
-      // Mark old fact as contradicted
-      db.prepare("UPDATE memory_facts SET status = 'contradicted', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .run(bestMatch.id);
-      logRevision(db, bestMatch.id, "contradicted", bestMatch.fact, newFact.fact, `contradicted by new fact (sim=${bestSim.toFixed(3)}): ${reason}`);
+      await port.updateFact(bestMatch.id, { status: "contradicted" });
+      await logRevision(port, bestMatch.id, "contradicted", bestMatch.fact, newFact.fact, `contradicted by new fact (sim=${bestSim.toFixed(3)}): ${reason}`);
 
-      // Create the new (corrected) fact
-      const factId = insertFact(db, newFact, scope);
-      logRevision(db, factId, "created", null, newFact.fact, `replaces contradicted fact #${bestMatch.id} (sim=${bestSim.toFixed(3)})`);
-      storeVec(factId, newEmb);
+      const factId = await insertFact(port, newFact, scope);
+      await logRevision(port, factId, "created", null, newFact.fact, `replaces contradicted fact #${bestMatch.id} (sim=${bestSim.toFixed(3)})`);
+      await storeVec(factId, newEmb);
 
       logger.info?.(`memory-bank: CONTRADICTED fact #${bestMatch.id} → new fact #${factId} (sim=${bestSim.toFixed(3)})`);
       return { action: "contradicted", factId, similarity: bestSim };
     }
-    // Not a contradiction — fall through to create new fact
   }
 
   // Below threshold or no contradiction: create new fact
-  const factId = insertFact(db, newFact, scope);
-  logRevision(db, factId, "created", null, newFact.fact, bestSim > 0 ? `new (best sim=${bestSim.toFixed(3)})` : "new (no similar facts)");
-  storeVec(factId, newEmb);
+  const factId = await insertFact(port, newFact, scope);
+  await logRevision(port, factId, "created", null, newFact.fact, bestSim > 0 ? `new (best sim=${bestSim.toFixed(3)})` : "new (no similar facts)");
+  await storeVec(factId, newEmb);
 
   logger.info?.(`memory-bank: CREATE fact #${factId} topic=${newFact.topic} conf=${newFact.confidence.toFixed(2)}`);
   return { action: "created", factId, similarity: bestSim };
 }
 
-function insertFact(db: Database, fact: ExtractedFact, scope?: string): number {
+async function insertFact(port: DatabasePort, fact: ExtractedFact, scope?: string): Promise<number> {
   const hnswKey = `memfact:${fact.topic}:${Date.now()}`;
-  const result = db.prepare(`
-    INSERT INTO memory_facts (topic, fact, confidence, source_type, temporal_type, scope, hnsw_key)
-    VALUES (?, ?, ?, 'conversation', ?, ?, ?)
-  `).run(fact.topic, fact.fact, fact.confidence, fact.temporal_type ?? "current_state", scope ?? "global", hnswKey);
-  return result.lastInsertRowid as number;
+  return port.storeFact({
+    topic: fact.topic,
+    fact: fact.fact,
+    confidence: fact.confidence,
+    sourceType: "conversation",
+    temporalType: fact.temporal_type ?? "current_state",
+    scope: scope ?? "global",
+    hnswKey,
+  });
 }
 
-function logRevision(
-  db: Database,
+async function logRevision(
+  port: DatabasePort,
   factId: number,
   revisionType: string,
   oldContent: string | null,
   newContent: string | null,
   reason: string,
-): void {
+): Promise<void> {
   try {
-    db.prepare(`
-      INSERT INTO memory_revisions (fact_id, revision_type, old_content, new_content, reason)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(factId, revisionType, oldContent, newContent, reason);
+    await port.storeRevision(factId, revisionType, oldContent, newContent, reason);
   } catch {
     // Non-critical — don't break consolidation
   }

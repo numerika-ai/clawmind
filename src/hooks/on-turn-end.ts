@@ -1,4 +1,5 @@
-import type { PluginApi, UnifiedDB, RufloHNSW } from "../types";
+import type { PluginApi } from "../types";
+import type { DatabasePort } from "../db/port";
 import type { UnifiedMemoryConfig } from "../config";
 import type { MemoryBankConfig } from "../memory-bank/types";
 import { autoTag } from "../utils/helpers";
@@ -29,18 +30,12 @@ interface NativeLanceManager {
   addEntry(entryId: number, text: string): Promise<boolean>;
 }
 
-interface FactEmbeddingStore {
-  storeFactEmbedding(factId: number, embeddingBuf: Buffer): void;
-}
-
 interface HookDependencies {
-  udb: UnifiedDB;
-  ruflo: RufloHNSW | null;
+  port: DatabasePort;
   lanceManager: NativeLanceManager | null;
   cfg: UnifiedMemoryConfig;
   memoryState: MemoryState;
   memoryBankConfig?: MemoryBankConfig;
-  embeddingStore?: FactEmbeddingStore | null;
 }
 
 /**
@@ -59,7 +54,7 @@ const TOOL_LOG_WHITELIST = new Set([
  * Creates the tool call logging hook for after_tool_call
  */
 export function createToolCallLogHook(deps: HookDependencies) {
-  const { udb, ruflo, lanceManager, cfg, memoryState } = deps;
+  const { port, lanceManager, cfg, memoryState } = deps;
 
   // Resolve filter: config can override with "all", "none", or string[] of tool names
   const filterCfg = (cfg as any).logToolCallsFilter;
@@ -93,13 +88,13 @@ export function createToolCallLogHook(deps: HookDependencies) {
       const resultPreview = error ? `ERROR: ${error}`.slice(0, 200) : resultStr.slice(0, 200);
       const status = error ? "error" : "success";
 
-      // Store in SQLite unified_entries
+      // Store in unified_entries via port
       const tags = autoTag(`${toolName} ${paramsPreview}`);
       const summary = `${toolName}(${status}): ${paramsPreview.slice(0, 80)}`;
       const hnswKey = `tool:${toolName}:${Date.now()}`;
 
       const agentId = (event.agentId ?? event.agent_id ?? (globalThis as any).__openclawAgentId ?? extractAgentFromSessionKey(event.sessionKey as string | undefined) ?? "main") as string;
-      const toolEntryId = udb.storeEntry({
+      const toolEntryId = await port.storeEntry({
         entryType: "tool",
         tags: tags.join(","),
         content: JSON.stringify({ tool: toolName, params: paramsPreview, result: resultPreview, status }),
@@ -112,28 +107,6 @@ export function createToolCallLogHook(deps: HookDependencies) {
       if (lanceManager?.isReady()) {
         lanceManager.addEntry(toolEntryId, summary).catch(() => {});
       }
-
-      // MoE Auto-Routing: when sessions_spawn is called, log the model routing decision
-      if (toolName === "sessions_spawn" && ruflo && params) {
-        try {
-          const task = (params.task ?? params.message ?? "") as string;
-          const modelUsed = (params.model ?? "unknown") as string;
-
-          // Log routing decision as pattern
-          const routingPattern = `moe-route: task="${task.slice(0, 100)}" → model=${modelUsed}`;
-          await ruflo.store(`moe:${Date.now()}`, routingPattern, {
-            tags: ["moe", "model-routing", modelUsed],
-            namespace: "pattern",
-          });
-
-          api.logger.info?.(`memory-unified: MoE logged: ${modelUsed} for "${task.slice(0, 50)}"`);
-        } catch {} // non-critical
-      }
-
-      // Trajectory step (fire and forget)
-      if (memoryState.activeTrajectoryId && ruflo) {
-        ruflo.trajectoryStep(memoryState.activeTrajectoryId, `tool:${toolName}`, status, status === "success" ? 0.8 : 0.2).catch(() => {});
-      }
     } catch (err) {
       // Silently skip — tool logging should never break the agent
       api.logger.warn?.("memory-unified: tool log failed:", String(err).slice(0, 100));
@@ -145,7 +118,7 @@ export function createToolCallLogHook(deps: HookDependencies) {
  * Creates the agent end hook for agent_end
  */
 export function createAgentEndHook(deps: HookDependencies) {
-  const { udb, ruflo, cfg, memoryState, memoryBankConfig } = deps;
+  const { port, cfg, memoryState, memoryBankConfig } = deps;
 
   return async function(api: PluginApi, event: Record<string, unknown>) {
     // Always clear dynamic tool policy — prevent stale policies across turns
@@ -162,39 +135,18 @@ export function createAgentEndHook(deps: HookDependencies) {
       if (memoryState.matchedSkillName && memoryState.matchedSkillId) {
         try {
           const summary = `${memoryState.turnPrompt?.slice(0, 100) ?? "?"} → ${responsePreview.slice(0, 200)}`;
-          udb.db.prepare(`
-            INSERT INTO skill_executions (skill_id, summary, status, output_summary, session_key)
-            VALUES (?, ?, ?, ?, ?)
-          `).run(
+
+          await port.logSkillExecution(
             memoryState.matchedSkillId,
             summary,
             success ? "success" : "error",
             responsePreview.slice(0, 1000),
-            event.sessionKey ?? "unknown"
+            (event.sessionKey as string) ?? "unknown"
           );
 
-          // Update skill use_count and success_rate
-          udb.db.prepare(`
-            UPDATE skills SET 
-              use_count = use_count + 1,
-              last_used = CURRENT_TIMESTAMP,
-              success_rate = (success_rate * use_count + ?) / (use_count + 1)
-            WHERE id = ?
-          `).run(success ? 1.0 : 0.0, memoryState.matchedSkillId);
+          await port.updateSkillStats(memoryState.matchedSkillId, success);
 
           api.logger.info?.(`memory-unified: logged execution for skill "${memoryState.matchedSkillName}" (${success ? "success" : "error"})`);
-
-          // Feed Ruflo Intelligence — store pattern from successful executions
-          if (success && ruflo) {
-            try {
-              const patternKey = `pattern:skill:${memoryState.matchedSkillName}:${Date.now()}`;
-              const patternVal = `skill:${memoryState.matchedSkillName} | query: ${memoryState.turnPrompt?.slice(0, 100)} | result: success | ts: ${new Date().toISOString()}`;
-              await ruflo.store(patternKey, patternVal, {
-                tags: ["pattern", "skill-execution", memoryState.matchedSkillName],
-                namespace: "pattern",
-              });
-            } catch {} // non-critical
-          }
 
           // ============================================================
           // PATTERN EXTRACTION (Phase 1)
@@ -204,31 +156,20 @@ export function createAgentEndHook(deps: HookDependencies) {
             if (keywords.length >= 3) {
               const keywordsJson = JSON.stringify(keywords.sort());
 
-              const existing = udb.db.prepare(
-                "SELECT id, confidence, success_count FROM patterns WHERE skill_name = ? AND keywords = ?"
-              ).get(memoryState.matchedSkillName, keywordsJson) as { id: number; confidence: number; success_count: number } | undefined;
+              const existingPatterns = await port.queryPatterns({
+                skillName: memoryState.matchedSkillName,
+                keywords: keywordsJson,
+              });
+              const existing = existingPatterns[0] as { id: number; confidence: number; success_count: number } | undefined;
 
               if (existing) {
-                // Boost confidence: +0.03 per success, cap at 0.95
                 const newConf = Math.min(0.95, existing.confidence + 0.03);
-                udb.db.prepare(
-                  "UPDATE patterns SET confidence = ?, success_count = success_count + 1, updated_at = CURRENT_TIMESTAMP, last_matched_at = CURRENT_TIMESTAMP WHERE id = ?"
-                ).run(newConf, existing.id);
-                udb.db.prepare(
-                  "INSERT INTO pattern_history (pattern_id, event_type, old_confidence, new_confidence, context) VALUES (?, 'success', ?, ?, ?)"
-                ).run(existing.id, existing.confidence, newConf, (memoryState.turnPrompt || "").slice(0, 200));
+                await port.updatePatternSuccess(existing.id, newConf);
+                await port.logPatternHistory(existing.id, "success", existing.confidence, newConf, (memoryState.turnPrompt || "").slice(0, 200));
                 api.logger.info?.(`memory-unified: pattern boosted for "${memoryState.matchedSkillName}" (${existing.confidence.toFixed(2)} -> ${newConf.toFixed(2)})`);
               } else {
-                // New pattern starts at 0.5
-                const info = udb.db.prepare(
-                  "INSERT INTO patterns (skill_name, keywords, confidence) VALUES (?, ?, 0.5)"
-                ).run(memoryState.matchedSkillName, keywordsJson);
-                // Log creation in history
-                if (info.lastInsertRowid) {
-                  udb.db.prepare(
-                    "INSERT INTO pattern_history (pattern_id, event_type, old_confidence, new_confidence, context) VALUES (?, 'created', 0, 0.5, ?)"
-                  ).run(info.lastInsertRowid, (memoryState.turnPrompt || "").slice(0, 200));
-                }
+                const patternId = await port.createPattern(memoryState.matchedSkillName, keywordsJson, 0.5);
+                await port.logPatternHistory(patternId, "created", 0, 0.5, (memoryState.turnPrompt || "").slice(0, 200));
                 api.logger.info?.(`memory-unified: new pattern created for "${memoryState.matchedSkillName}" with ${keywords.length} keywords`);
               }
             }
@@ -246,18 +187,12 @@ export function createAgentEndHook(deps: HookDependencies) {
       // ============================================================
       if (memoryState.matchedSkillName && !success) {
         try {
-          const failPatterns = udb.db.prepare(
-            "SELECT id, confidence FROM patterns WHERE skill_name = ?"
-          ).all(memoryState.matchedSkillName) as Array<{ id: number; confidence: number }>;
+          const failPatterns = await port.queryPatterns({ skillName: memoryState.matchedSkillName });
 
           for (const p of failPatterns) {
             const newConf = Math.max(0.05, p.confidence - 0.05);
-            udb.db.prepare(
-              "UPDATE patterns SET confidence = ?, failure_count = failure_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-            ).run(newConf, p.id);
-            udb.db.prepare(
-              "INSERT INTO pattern_history (pattern_id, event_type, old_confidence, new_confidence) VALUES (?, 'failure', ?, ?)"
-            ).run(p.id, p.confidence, newConf);
+            await port.updatePatternFailure(p.id, newConf);
+            await port.logPatternHistory(p.id, "failure", p.confidence, newConf);
           }
 
           if (failPatterns.length > 0) {
@@ -287,41 +222,32 @@ export function createAgentEndHook(deps: HookDependencies) {
           const channel = convPrompt.match(/\[WhatsApp|Mattermost|Discord/i)?.[0]?.replace('[','') || 'unknown';
 
           // Find existing active conversation with similar tags
-          const recentConversations = udb.db.prepare(
-            "SELECT id, thread_id, topic, tags, summary, message_count, details FROM conversations WHERE status = 'active' AND updated_at > datetime('now', '-2 hours') ORDER BY updated_at DESC LIMIT 5"
-          ).all() as any[];
+          const recentConversations = await port.queryConversations({
+            status: 'active',
+            recentHours: 2,
+            limit: 5,
+          });
 
           let conversationId: number | null = null;
           let isNewConversation = true;
 
           for (const conv of recentConversations) {
             const existingTags: string[] = JSON.parse(conv.tags || '[]');
-            const overlap = convTags.filter(t => existingTags.includes(t)).length;
+            const overlap = convTags.filter((t: string) => existingTags.includes(t)).length;
             if (overlap >= 1 || conv.topic.toLowerCase().includes(topic.toLowerCase().slice(0, 20))) {
-              conversationId = conv.id;
+              conversationId = conv.id as number;
               isNewConversation = false;
 
               const newSummary = convResponse.length > 50
                 ? convResponse.slice(0, 150).replace(/\n/g, ' ').trim()
                 : conv.summary;
 
-              udb.db.prepare(`
-                UPDATE conversations
-                SET summary = ?,
-                    message_count = message_count + 1,
-                    updated_at = CURRENT_TIMESTAMP,
-                    last_accessed_at = CURRENT_TIMESTAMP,
-                    tags = ?,
-                    details = CASE WHEN length(details || '') < 2000
-                      THEN (COALESCE(details, '') || char(10) || ?)
-                      ELSE details END
-                WHERE id = ?
-              `).run(
-                newSummary,
-                JSON.stringify([...new Set([...existingTags, ...convTags])]),
-                `[${new Date().toISOString().slice(11,16)}] ${topic.slice(0, 80)}`,
-                conversationId
-              );
+              await port.updateConversation(conversationId!, {
+                summary: newSummary,
+                tags: JSON.stringify([...new Set([...existingTags, ...convTags])]),
+                incrementMessageCount: true,
+                details: `[${new Date().toISOString().slice(11,16)}] ${topic.slice(0, 80)}`,
+              });
               break;
             }
           }
@@ -332,43 +258,33 @@ export function createAgentEndHook(deps: HookDependencies) {
               ? convResponse.slice(0, 150).replace(/\n/g, ' ').trim()
               : topic;
 
-            const result = udb.db.prepare(`
-              INSERT OR IGNORE INTO conversations (thread_id, topic, tags, channel, participants, summary, details, key_facts)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `).run(
+            conversationId = await port.createConversation({
               threadId,
-              topic.slice(0, 200),
-              JSON.stringify(convTags),
+              topic: topic.slice(0, 200),
+              tags: JSON.stringify(convTags),
               channel,
-              JSON.stringify(['bartosz', 'wiki']),
+              participants: JSON.stringify(['bartosz', 'wiki']),
               summary,
-              `[${new Date().toISOString().slice(11,16)}] ${topic.slice(0, 200)}`,
-              JSON.stringify([])
-            );
-            conversationId = result.lastInsertRowid as number;
+              details: `[${new Date().toISOString().slice(11,16)}] ${topic.slice(0, 200)}`,
+              keyFacts: JSON.stringify([]),
+            });
           }
 
-          if (conversationId) {
+          if (conversationId != null) {
+            const cid = conversationId;
             const userSummary = convPrompt.slice(0, 200).replace(/\n/g, ' ').trim();
             const assistantSummary = convResponse.slice(0, 200).replace(/\n/g, ' ').trim();
 
             if (userSummary.length > 10) {
-              udb.db.prepare(`
-                INSERT INTO conversation_messages (conversation_id, role, content_summary, has_decision, has_action)
-                VALUES (?, 'user', ?, ?, ?)
-              `).run(conversationId, userSummary, isDecision(convPrompt) ? 1 : 0, isActionRequest(convPrompt) ? 1 : 0);
+              await port.addConversationMessage(cid, 'user', userSummary, isDecision(convPrompt), isActionRequest(convPrompt));
             }
 
             if (assistantSummary.length > 10) {
-              udb.db.prepare(`
-                INSERT INTO conversation_messages (conversation_id, role, content_summary, has_decision, has_action)
-                VALUES (?, 'assistant', ?, ?, ?)
-              `).run(conversationId, assistantSummary, isResolution(convResponse) ? 1 : 0, 0);
+              await port.addConversationMessage(cid, 'assistant', assistantSummary, isResolution(convResponse), false);
             }
 
             if (isResolution(convResponse) && isNewConversation) {
-              udb.db.prepare("UPDATE conversations SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP WHERE id = ?")
-                .run(conversationId);
+              await port.resolveConversation(cid);
             }
           }
 
@@ -390,15 +306,13 @@ export function createAgentEndHook(deps: HookDependencies) {
           // Skip if too short or cron/heartbeat
           const isCron = /^\s*\[?cron:|HEARTBEAT_OK|\[Subagent Context\]|Auto-handoff check/i.test(mbPrompt);
           if (!isCron && conversationText.length >= memoryBankConfig.minConversationLength) {
-            // Fire and forget — don't block agent_end
-            // Determine scope: agent-specific facts use agent_id, otherwise global
             const factScope = memoryState.agentId && memoryState.agentId !== "main" ? memoryState.agentId : "global";
 
             extractFacts(conversationText, memoryBankConfig)
               .then(async (facts) => {
                 for (const fact of facts) {
                   try {
-                    await consolidateFact(fact, udb.db, memoryBankConfig, deps.lanceManager, api.logger, factScope, deps.embeddingStore);
+                    await consolidateFact(fact, port, memoryBankConfig, null, api.logger, factScope);
                   } catch (consErr) {
                     api.logger.warn?.("memory-bank: consolidation error:", String(consErr).slice(0, 100));
                   }
@@ -414,17 +328,6 @@ export function createAgentEndHook(deps: HookDependencies) {
         } catch (mbErr) {
           api.logger.warn?.("memory-bank: memory bank error:", String(mbErr).slice(0, 100));
         }
-      }
-
-      // Trajectory end (Ruflo SONA)
-      if (memoryState.activeTrajectoryId && ruflo) {
-        try {
-          await ruflo.trajectoryEnd(
-            memoryState.activeTrajectoryId,
-            success,
-            memoryState.matchedSkillName ? `Skill: ${memoryState.matchedSkillName}` : "No skill matched"
-          );
-        } catch {}
       }
 
       api.logger.info?.(`memory-unified: turn ended (skill: ${memoryState.matchedSkillName ?? "none"}, success: ${success})`);

@@ -1,9 +1,14 @@
 import { Type } from "@sinclair/typebox";
-import type { ToolDef, ToolResult, UnifiedDB } from "../types";
+import type { ToolDef, ToolResult } from "../types";
+import type { DatabasePort } from "../db/port";
 import type { EntryType } from "../config";
-import type { VectorManager } from "../db/vector-manager";
 
-export function createUnifiedSearchTool(udb: UnifiedDB, lanceManager: VectorManager | null): ToolDef {
+interface VectorSearcher {
+  isReady(): boolean;
+  search(query: string, topK?: number, excludeTypes?: string[]): Promise<Array<{ entryId: number; distance: number }>>;
+}
+
+export function createUnifiedSearchTool(port: DatabasePort, lanceManager: VectorSearcher | null): ToolDef {
   return {
     name: "unified_search",
     label: "Unified Memory Search",
@@ -20,10 +25,10 @@ export function createUnifiedSearchTool(udb: UnifiedDB, lanceManager: VectorMana
       const limit = (params.limit as number) ?? 10;
       const agentId = params.agent_id as string | undefined;
 
-      // FTS5 keyword search via SQLite
-      const sqlResults = udb.ftsSearch(query, entryType, limit, agentId);
+      // FTS5 keyword search
+      const sqlResults = await port.ftsSearch(query, entryType, limit, agentId);
 
-      // Semantic vector search via sqlite-vec + Nemotron embeddings
+      // Semantic vector search
       let vectorLines: string[] = [];
       let vectorCount = 0;
       const allHitIds: number[] = [];
@@ -34,8 +39,8 @@ export function createUnifiedSearchTool(udb: UnifiedDB, lanceManager: VectorMana
           vectorCount = vectorResults.length;
           for (const r of vectorResults) {
             allHitIds.push(r.entryId);
-            // Enrich with text from SQLite by entryId
-            const entry = udb.getEntryById?.(r.entryId);
+            const entries = await port.queryEntries({ ids: [r.entryId] });
+            const entry = entries[0];
             const text = entry?.summary || entry?.content?.slice(0, 120) || `entry#${r.entryId}`;
             const similarity = Math.max(0, Math.round((1 - (r.distance || 0)) * 100));
             vectorLines.push(`- [${similarity}%] [${entry?.entry_type || "?"}] ${text}`);
@@ -47,11 +52,7 @@ export function createUnifiedSearchTool(udb: UnifiedDB, lanceManager: VectorMana
       for (const e of sqlResults) { if (e.id) allHitIds.push(e.id); }
       if (allHitIds.length > 0) {
         try {
-          const ids = [...new Set(allHitIds)];
-          const placeholders = ids.map(() => "?").join(",");
-          (udb as any).db.prepare(
-            `UPDATE unified_entries SET access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`
-          ).run(...ids);
+          await port.updateEntryAccessCount([...new Set(allHitIds)]);
         } catch {} // non-critical
       }
 

@@ -5,12 +5,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@sinclair/typebox";
-import type { ToolDef, ToolResult, UnifiedDB } from "../types";
+import type { ToolDef, ToolResult } from "../types";
+import type { DatabasePort } from "../db/port";
 
 const DEFAULT_WORKSPACE = "/home/tank/.openclaw/workspace";
 const INDEXABLE_EXTENSIONS = ['.md', '.txt', '.json', '.ts', '.py', '.sh'];
 
-export function createUnifiedIndexFilesTool(udb: UnifiedDB): ToolDef {
+export function createUnifiedIndexFilesTool(port: DatabasePort): ToolDef {
   return {
     name: "unified_index_files",
     label: "Index Files",
@@ -33,9 +34,9 @@ export function createUnifiedIndexFilesTool(udb: UnifiedDB): ToolDef {
       let skipped = 0;
 
       try {
-        const entries = fs.readdirSync(directory, { withFileTypes: true });
+        const dirEntries = fs.readdirSync(directory, { withFileTypes: true });
 
-        for (const entry of entries) {
+        for (const entry of dirEntries) {
           if (processed >= limit) break;
 
           if (entry.isFile()) {
@@ -44,11 +45,10 @@ export function createUnifiedIndexFilesTool(udb: UnifiedDB): ToolDef {
 
             if (INDEXABLE_EXTENSIONS.includes(ext)) {
               // Check if already indexed
-              const existing = udb.searchEntries("file").find(
-                (e: any) => e.source_path === filePath
-              );
+              const existing = await port.queryEntries({ entryType: "file", limit: 500 });
+              const alreadyIndexed = existing.find((e: any) => e.source_path === filePath);
 
-              if (existing) {
+              if (alreadyIndexed) {
                 skipped++;
                 continue;
               }
@@ -66,7 +66,7 @@ export function createUnifiedIndexFilesTool(udb: UnifiedDB): ToolDef {
                        .toLowerCase()
                 ).join(',');
 
-                udb.storeEntry({
+                await port.storeEntry({
                   entryType: "file",
                   content,
                   tags,

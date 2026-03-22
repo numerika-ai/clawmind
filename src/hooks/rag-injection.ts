@@ -1,7 +1,8 @@
-import type { PluginApi, UnifiedDB, RufloHNSW } from "../types";
+import type { PluginApi } from "../types";
+import type { DatabasePort } from "../db/port";
 import type { UnifiedMemoryConfig } from "../config";
 import type { MemoryBankConfig } from "../memory-bank/types";
-import { embed, embeddingToBuffer } from "../embedding/nemotron";
+import { embed } from "../embedding/nemotron";
 import { rerankResults, type RerankCandidate } from "../reranking/nemotron-rerank";
 import { extractAgentFromSessionKey } from "../utils/helpers";
 
@@ -27,20 +28,14 @@ interface ExtractKeywordsFunction {
   (text: string): string[];
 }
 
-interface FactVecSearch {
-  searchFactsByVector(queryEmbeddingBuf: Buffer, topK: number, scope?: string): Array<{ factId: number; distance: number; topic: string; fact: string; confidence: number }>;
-}
-
 interface HookDependencies {
-  udb: UnifiedDB;
-  ruflo: RufloHNSW | null;
+  port: DatabasePort;
   lanceManager: NativeLanceManager | null;
   cfg: UnifiedMemoryConfig;
   memoryState: MemoryState;
   qwenSemanticSearch: QwenSearchFunction;
   extractKeywords: ExtractKeywordsFunction;
   memoryBankConfig?: MemoryBankConfig;
-  factVecSearch?: FactVecSearch | null;
 }
 
 /**
@@ -48,7 +43,7 @@ interface HookDependencies {
  * This hook performs multi-layer memory search and injects context
  */
 export function createRagInjectionHook(deps: HookDependencies) {
-  const { udb, ruflo, lanceManager, cfg, memoryState, qwenSemanticSearch, extractKeywords } = deps;
+  const { port, lanceManager, cfg, memoryState, qwenSemanticSearch, extractKeywords } = deps;
 
   return async function(api: PluginApi, event: Record<string, unknown>) {
     const prompt = event.prompt as string | undefined;
@@ -98,37 +93,31 @@ export function createRagInjectionHook(deps: HookDependencies) {
           .join(" OR ");
 
         if (keywords.length > 0) {
-          const ftsResults = udb.db.prepare(`
-            SELECT ue.hnsw_key, ue.content, ue.source_path, ue.summary,
-                   length(ue.content) as content_len
-            FROM unified_fts fts
-            JOIN unified_entries ue ON ue.id = fts.rowid
-            WHERE unified_fts MATCH ?
-            AND ue.entry_type = 'skill'
-            ORDER BY rank
-            LIMIT 3
-          `).all(keywords);
+          const ftsResults = await port.ftsSearchSkills(keywords, 3);
 
           // LAYER 2: Direct search in skills table (fast fallback, ~30 rows)
           const skillWords = (cleanPrompt.match(/[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}/g) || []).slice(0, 10);
           const seenFtsSkills = new Set<string>();
-          for (const r of ftsResults as any[]) {
+          for (const r of ftsResults) {
             const n = (r.hnsw_key || "").replace("skill-full:", "").replace("skill:", "");
             seenFtsSkills.add(n);
           }
           try {
-            const likeOr = skillWords.map((w: string) => `(s.description LIKE '%${w.replace(/'/g, "")}%' OR s.keywords LIKE '%${w.replace(/'/g, "")}%')`).join(" OR ");
-            if (likeOr) {
-              const skillRows = udb.db.prepare(`SELECT s.name, s.description, s.procedure, length(s.procedure) as proc_len FROM skills s WHERE ${likeOr} ORDER BY s.last_used DESC NULLS LAST LIMIT 3`).all() as any[];
-              for (const s of skillRows) {
-                if (!seenFtsSkills.has(s.name)) {
-                  (ftsResults as any[]).push({ hnsw_key: `skill-full:${s.name}`, content: s.procedure, source_path: null, summary: s.description, content_len: s.proc_len || 0 });
-                }
+            const skillRows = await port.searchSkillsByKeywords(skillWords, 3);
+            for (const s of skillRows) {
+              if (!seenFtsSkills.has(s.name)) {
+                ftsResults.push({
+                  hnsw_key: `skill-full:${s.name}`,
+                  content: s.procedure,
+                  source_path: null,
+                  summary: s.description,
+                  content_len: s.proc_len || (s.procedure ? s.procedure.length : 0),
+                });
               }
             }
           } catch {}
 
-          for (const r of ftsResults as any[]) {
+          for (const r of ftsResults) {
             const name = (r.hnsw_key || "").replace("skill-full:", "").replace("skill:", "");
             const contentLen = r.content_len || 0;
 
@@ -139,7 +128,7 @@ export function createRagInjectionHook(deps: HookDependencies) {
                 memoryState.matchedSkillName = name;
                 memoryState.turnPrompt = prompt.slice(0, 500);
                 try {
-                  const skill = udb.getSkillByName(name);
+                  const skill = await port.getSkillByName(name);
                   if (skill) memoryState.matchedSkillId = skill.id;
                 } catch {}
               }
@@ -161,12 +150,9 @@ export function createRagInjectionHook(deps: HookDependencies) {
       // ============================================================
       if (memoryState.matchedSkillName) {
         try {
-          const skillObj = udb.getSkillByName(memoryState.matchedSkillName);
+          const skillObj = await port.getSkillByName(memoryState.matchedSkillName);
           if (skillObj) {
-            const history = udb.db.prepare(`
-              SELECT summary, status, timestamp FROM skill_executions
-              WHERE skill_id = ? ORDER BY timestamp DESC LIMIT 3
-            `).all(skillObj.id) as any[];
+            const history = await port.getSkillExecutionHistory(skillObj.id, 3);
             for (const h of history) {
               slimLines.push(`[history] ${memoryState.matchedSkillName} (${h.timestamp}): ${h.status} — ${(h.summary || "").slice(0, 120)}`);
             }
@@ -175,7 +161,7 @@ export function createRagInjectionHook(deps: HookDependencies) {
       }
 
       // Recent executions across all skills
-      const recentSkills = udb.getRecentExecutions(3);
+      const recentSkills = await port.getRecentExecutions(3);
       for (const s of recentSkills) {
         slimLines.push(`[recent] ${s.skill_name}: ${s.status}`);
       }
@@ -188,10 +174,7 @@ export function createRagInjectionHook(deps: HookDependencies) {
           const hnswResults = await lanceManager.search(prompt, 5);
           if (hnswResults.length > 0) {
             const hnswEntryIds = hnswResults.map(r => r.entryId);
-            const placeholders = hnswEntryIds.map(() => '?').join(',');
-            const hnswEntries = udb.db.prepare(
-              `SELECT id, entry_type, content, summary, hnsw_key FROM unified_entries WHERE id IN (${placeholders})`
-            ).all(...hnswEntryIds) as any[];
+            const hnswEntries = await port.queryEntries({ ids: hnswEntryIds });
 
             const entryMap = new Map(hnswEntries.map((e: any) => [e.id, e]));
 
@@ -208,7 +191,7 @@ export function createRagInjectionHook(deps: HookDependencies) {
                 memoryState.matchedSkillName = name;
                 memoryState.turnPrompt = prompt.slice(0, 500);
                 try {
-                  const skill = udb.getSkillByName(name);
+                  const skill = await port.getSkillByName(name);
                   if (skill) memoryState.matchedSkillId = skill.id;
                 } catch {}
                 slimLines.push(`[VEC MATCH] ${name} (${(sim * 100).toFixed(0)}% semantic, ${entry.entry_type})`);
@@ -253,19 +236,22 @@ export function createRagInjectionHook(deps: HookDependencies) {
       // ============================================================
       if (!matchedProcedure) {
         try {
-          const qwenResults = await qwenSemanticSearch(prompt, udb.db, api.logger, 2);
-          for (const r of qwenResults) {
-            if (r.content.length > 500 && !matchedProcedure && r.similarity >= 0.60) { // require 60% for full procedure
-              matchedProcedure = r.content.slice(0, 4000);
-              memoryState.matchedSkillName = r.name;
-              memoryState.turnPrompt = prompt.slice(0, 500);
-              try {
-                const skill = udb.getSkillByName(r.name);
-                if (skill) memoryState.matchedSkillId = skill.id;
-              } catch {}
-              slimLines.push(`[QWEN MATCH] ${r.name} (${(r.similarity * 100).toFixed(0)}% semantic)`);
-            } else {
-              slimLines.push(`[qwen] ${r.name} (${(r.similarity * 100).toFixed(0)}%)`);
+          const rawDb = (port as any).rawDb;
+          if (rawDb) {
+            const qwenResults = await qwenSemanticSearch(prompt, rawDb, api.logger, 2);
+            for (const r of qwenResults) {
+              if (r.content.length > 500 && !matchedProcedure && r.similarity >= 0.60) { // require 60% for full procedure
+                matchedProcedure = r.content.slice(0, 4000);
+                memoryState.matchedSkillName = r.name;
+                memoryState.turnPrompt = prompt.slice(0, 500);
+                try {
+                  const skill = await port.getSkillByName(r.name);
+                  if (skill) memoryState.matchedSkillId = skill.id;
+                } catch {}
+                slimLines.push(`[QWEN MATCH] ${r.name} (${(r.similarity * 100).toFixed(0)}% semantic)`);
+              } else {
+                slimLines.push(`[qwen] ${r.name} (${(r.similarity * 100).toFixed(0)}%)`);
+              }
             }
           }
         } catch (qErr) {
@@ -279,13 +265,11 @@ export function createRagInjectionHook(deps: HookDependencies) {
       try {
         const promptKeywords = extractKeywords(prompt);
         if (promptKeywords.length >= 2) {
-          const allPatterns = udb.db.prepare(
-            "SELECT skill_name, keywords, confidence FROM patterns WHERE confidence > 0.3 ORDER BY confidence DESC LIMIT 20"
-          ).all() as Array<{ skill_name: string; keywords: string; confidence: number }>;
+          const allPatterns = await port.queryPatterns({ minConfidence: 0.3, limit: 20 });
 
           for (const pattern of allPatterns) {
             const patternKw: string[] = JSON.parse(pattern.keywords);
-            const overlap = patternKw.filter(kw => promptKeywords.includes(kw)).length;
+            const overlap = patternKw.filter((kw: string) => promptKeywords.includes(kw)).length;
             const overlapRatio = overlap / patternKw.length;
 
             if (overlapRatio > 0.5 && pattern.confidence > 0.4) {
@@ -303,15 +287,12 @@ export function createRagInjectionHook(deps: HookDependencies) {
       // STEP 5: Conversation context
       // ============================================================
       try {
-        const activeConversations = udb.db.prepare(`
-          SELECT topic, tags, summary, status, message_count, updated_at
-          FROM conversations
-          WHERE status = 'active'
-          AND updated_at > datetime('now', '-24 hours')
-          AND confidence > 0.3
-          ORDER BY updated_at DESC
-          LIMIT 5
-        `).all() as any[];
+        const activeConversations = await port.queryConversations({
+          status: 'active',
+          recentHours: 24,
+          minConfidence: 0.3,
+          limit: 5,
+        });
 
         if (activeConversations.length > 0) {
           slimLines.push('[active threads]');
@@ -331,10 +312,10 @@ export function createRagInjectionHook(deps: HookDependencies) {
         try {
           const mbConfig = deps.memoryBankConfig;
           const queryEmb = await embed(prompt, "query");
-          if (queryEmb && deps.factVecSearch) {
+          if (queryEmb) {
             const currentScope = memoryState.agentId ?? "main";
-            const vecResults = deps.factVecSearch.searchFactsByVector(
-              embeddingToBuffer(queryEmb),
+            const vecResults = await port.searchFactsByVector(
+              queryEmb,
               mbConfig.ragTopK * 2, // fetch extra for filtering
               currentScope,
             );
@@ -350,42 +331,40 @@ export function createRagInjectionHook(deps: HookDependencies) {
               for (const f of topFacts) {
                 slimLines.push(`  [${f.topic}] ${f.fact} (${(f.confidence * 100).toFixed(0)}%)`);
                 try {
-                  udb.db.prepare(
-                    "UPDATE memory_facts SET access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP WHERE id = ?"
-                  ).run(f.factId);
+                  await port.updateFactAccessCount(f.factId);
                 } catch {}
               }
-              api.logger.info?.(`memory-bank: injected ${topFacts.length} facts via sqlite-vec`);
-            }
-          } else if (queryEmb) {
-            // Fallback: no vec table yet, use old per-fact embedding (slow)
-            const currentScope = memoryState.agentId ?? "main";
-            const activeFacts = udb.db.prepare(
-              "SELECT id, topic, fact, confidence FROM memory_facts WHERE status = 'active' AND confidence > 0.3 AND (scope = 'global' OR scope = ?) ORDER BY confidence DESC LIMIT 50"
-            ).all(currentScope) as Array<{ id: number; topic: string; fact: string; confidence: number }>;
+              api.logger.info?.(`memory-bank: injected ${topFacts.length} facts via vector search`);
+            } else {
+              // Fallback: no vec results, use query-based fact search
+              const activeFacts = await port.queryFacts({
+                status: 'active',
+                scope: currentScope,
+                minConfidence: 0.3,
+                limit: 50,
+              });
 
-            const scored: Array<{ id: number; topic: string; fact: string; confidence: number; similarity: number }> = [];
-            for (const f of activeFacts) {
-              const fEmb = await embed(f.fact, "passage");
-              if (!fEmb) continue;
-              const { cosineSim } = await import("../embedding/nemotron");
-              const sim = cosineSim(queryEmb, fEmb);
-              if (sim > 0.35) scored.push({ ...f, similarity: sim });
-            }
-
-            scored.sort((a, b) => b.similarity - a.similarity);
-            const topFacts = scored.slice(0, mbConfig.ragTopK);
-            if (topFacts.length > 0) {
-              slimLines.push("[memory bank]");
-              for (const f of topFacts) {
-                slimLines.push(`  [${f.topic}] ${f.fact} (${(f.confidence * 100).toFixed(0)}%)`);
-                try {
-                  udb.db.prepare(
-                    "UPDATE memory_facts SET access_count = access_count + 1, last_accessed_at = CURRENT_TIMESTAMP WHERE id = ?"
-                  ).run(f.id);
-                } catch {}
+              const scored: Array<{ id: number; topic: string; fact: string; confidence: number; similarity: number }> = [];
+              for (const f of activeFacts) {
+                const fEmb = await embed(f.fact, "passage");
+                if (!fEmb) continue;
+                const { cosineSim } = await import("../embedding/nemotron");
+                const sim = cosineSim(queryEmb, fEmb);
+                if (sim > 0.35) scored.push({ ...f, similarity: sim });
               }
-              api.logger.info?.(`memory-bank: injected ${topFacts.length} facts (fallback mode)`);
+
+              scored.sort((a, b) => b.similarity - a.similarity);
+              const fallbackFacts = scored.slice(0, mbConfig.ragTopK);
+              if (fallbackFacts.length > 0) {
+                slimLines.push("[memory bank]");
+                for (const f of fallbackFacts) {
+                  slimLines.push(`  [${f.topic}] ${f.fact} (${(f.confidence * 100).toFixed(0)}%)`);
+                  try {
+                    await port.updateFactAccessCount(f.id);
+                  } catch {}
+                }
+                api.logger.info?.(`memory-bank: injected ${fallbackFacts.length} facts (fallback mode)`);
+              }
             }
           }
         } catch (mbErr) {
@@ -411,9 +390,9 @@ export function createRagInjectionHook(deps: HookDependencies) {
       // ============================================================
       if (memoryState.matchedSkillName) {
         try {
-          const skill = udb.getSkillByName(memoryState.matchedSkillName);
-          if (skill && (skill as any).required_tools) {
-            const requiredTools: string[] = JSON.parse((skill as any).required_tools);
+          const skill = await port.getSkillByName(memoryState.matchedSkillName);
+          if (skill && skill.required_tools) {
+            const requiredTools: string[] = JSON.parse(skill.required_tools);
             if (requiredTools.length > 0) {
               (globalThis as any).__openclawDynamicToolPolicy = {
                 allow: requiredTools
@@ -429,16 +408,6 @@ export function createRagInjectionHook(deps: HookDependencies) {
         }
       } else {
         (globalThis as any).__openclawDynamicToolPolicy = undefined;
-      }
-
-      // Start trajectory if enabled
-      if (cfg.trajectoryTracking && ruflo) {
-        try {
-          memoryState.activeTrajectoryId = await ruflo.trajectoryStart(
-            prompt.slice(0, 200),
-            "memory-unified"
-          );
-        } catch {}
       }
 
       return { prependContext: contextBlock };

@@ -3,10 +3,12 @@
  */
 
 const DEFAULT_DB_PATH = "skill-memory.db";
-const ALLOWED_KEYS = ["dbPath", "ragSlim", "logToolCalls", "logToolCallsFilter", "trajectoryTracking", "ragTopK", "memoryBank", "embeddingDim", "embeddingModel", "rerankUrl", "rerankEnabled"];
+const ALLOWED_KEYS = ["dbPath", "backend", "postgresUrl", "ragSlim", "logToolCalls", "logToolCallsFilter", "trajectoryTracking", "ragTopK", "memoryBank", "embeddingDim", "embeddingModel", "rerankUrl", "rerankEnabled"];
 
 export interface UnifiedMemoryConfig {
   dbPath: string;
+  backend: "sqlite" | "postgres";
+  postgresUrl: string;
   ragSlim: boolean;
   logToolCalls: boolean;
   logToolCallsFilter: "all" | "none" | "whitelist" | string[];  // "all" = log everything, "none" = log nothing, "whitelist" = built-in, string[] = custom
@@ -53,6 +55,8 @@ export const unifiedConfigSchema = {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       return {
         dbPath: DEFAULT_DB_PATH,
+        backend: "postgres" as const,
+        postgresUrl: process.env.POSTGRES_URL ?? "postgresql://openclaw:OpenClaw2026%21@192.168.1.76:5432/openclaw_platform",
         ragSlim: true,
         logToolCalls: true,
         logToolCallsFilter: "whitelist",
@@ -107,6 +111,8 @@ export const unifiedConfigSchema = {
 
     return {
       dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : DEFAULT_DB_PATH,
+      backend: (cfg.backend === "sqlite" ? "sqlite" : "postgres") as "sqlite" | "postgres",
+      postgresUrl: typeof cfg.postgresUrl === "string" ? cfg.postgresUrl : (process.env.POSTGRES_URL ?? "postgresql://openclaw:OpenClaw2026%21@192.168.1.76:5432/openclaw_platform"),
       ragSlim: cfg.ragSlim !== false,
       logToolCalls: cfg.logToolCalls !== false,
       logToolCallsFilter,

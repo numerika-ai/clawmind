@@ -1,18 +1,15 @@
 /**
  * Memory Bank management tool — list, search, add, edit, delete, status
+ *
+ * Now uses DatabasePort (async) for backend-agnostic DB access.
  */
 
 import { Type } from "@sinclair/typebox";
-import type { Database } from "better-sqlite3";
 import type { ToolDef, ToolResult } from "../types";
-import { qwenEmbed, cosineSim, embeddingToBuffer } from "../embedding/nemotron";
-import type { MemoryFact } from "../memory-bank/types";
+import type { DatabasePort } from "../db/port";
+import { qwenEmbed, cosineSim } from "../embedding/nemotron";
 
-interface FactVecSearch {
-  searchFactsByVector(queryEmbeddingBuf: Buffer, topK: number, scope?: string): Array<{ factId: number; distance: number; topic: string; fact: string; confidence: number }>;
-}
-
-export function createMemoryBankManageTool(db: Database, factVecSearch?: FactVecSearch | null): ToolDef {
+export function createMemoryBankManageTool(port: DatabasePort): ToolDef {
   return {
     name: "memory_bank_manage",
     label: "Memory Bank Manager",
@@ -34,17 +31,17 @@ export function createMemoryBankManageTool(db: Database, factVecSearch?: FactVec
 
       switch (action) {
         case "list":
-          return listFacts(db, params, limit);
+          return listFacts(port, params, limit);
         case "search":
-          return searchFacts(db, params, limit, factVecSearch);
+          return searchFacts(port, params, limit);
         case "add":
-          return addFact(db, params);
+          return addFact(port, params);
         case "edit":
-          return editFact(db, params);
+          return editFact(port, params);
         case "delete":
-          return deleteFact(db, params);
+          return deleteFact(port, params);
         case "status":
-          return getStatus(db);
+          return getStatus(port);
         default:
           return { content: [{ type: "text", text: `Unknown action: ${action}. Use: list, search, add, edit, delete, status` }] };
       }
@@ -52,22 +49,15 @@ export function createMemoryBankManageTool(db: Database, factVecSearch?: FactVec
   };
 }
 
-function listFacts(db: Database, params: Record<string, unknown>, limit: number): ToolResult {
+async function listFacts(port: DatabasePort, params: Record<string, unknown>, limit: number): Promise<ToolResult> {
   const topic = params.topic as string | undefined;
   const status = (params.status as string) ?? "active";
 
-  let query = "SELECT id, topic, fact, confidence, status, scope, temporal_type, access_count, created_at, updated_at FROM memory_facts WHERE status = ?";
-  const args: unknown[] = [status];
-
-  if (topic) {
-    query += " AND topic = ?";
-    args.push(topic);
-  }
-
-  query += " ORDER BY confidence DESC, updated_at DESC LIMIT ?";
-  args.push(limit);
-
-  const facts = db.prepare(query).all(...args) as any[];
+  const facts = await port.queryFacts({
+    topic: topic ?? undefined,
+    status,
+    limit,
+  });
 
   if (facts.length === 0) {
     return { content: [{ type: "text", text: `No facts found (status=${status}${topic ? `, topic=${topic}` : ""})` }] };
@@ -83,7 +73,7 @@ function listFacts(db: Database, params: Record<string, unknown>, limit: number)
   };
 }
 
-async function searchFacts(db: Database, params: Record<string, unknown>, limit: number, factVecSearch?: FactVecSearch | null): Promise<ToolResult> {
+async function searchFacts(port: DatabasePort, params: Record<string, unknown>, limit: number): Promise<ToolResult> {
   const query = params.query as string;
   if (!query) {
     return { content: [{ type: "text", text: "Error: query parameter required for search" }] };
@@ -92,10 +82,12 @@ async function searchFacts(db: Database, params: Record<string, unknown>, limit:
   const queryEmb = await qwenEmbed(query);
 
   if (!queryEmb) {
-    // Fallback to LIKE search if embedding unavailable
-    const likeFacts = db.prepare(
-      "SELECT id, topic, fact, confidence, status, scope FROM memory_facts WHERE status = 'active' AND fact LIKE ? ORDER BY confidence DESC LIMIT ?"
-    ).all(`%${query}%`, limit) as any[];
+    // Fallback to text search if embedding unavailable
+    const likeFacts = await port.queryFacts({
+      status: "active",
+      textSearch: query,
+      limit,
+    });
 
     const lines = likeFacts.map((f: any) =>
       `#${f.id} [${f.topic}] (${(f.confidence * 100).toFixed(0)}%) ${f.fact}`
@@ -106,27 +98,29 @@ async function searchFacts(db: Database, params: Record<string, unknown>, limit:
     };
   }
 
-  // Vector-first: single sqlite-vec KNN query instead of O(n) per-fact embedding
-  if (factVecSearch) {
-    const vecResults = factVecSearch.searchFactsByVector(embeddingToBuffer(queryEmb), limit);
+  // Vector-first: single KNN query
+  try {
+    const vecResults = await port.searchFactsByVector(queryEmb, limit);
     const topFacts = vecResults
       .map(r => ({ ...r, similarity: 1 - r.distance }))
       .filter(r => r.similarity > 0.3);
 
-    const lines = topFacts.map(f =>
-      `#${f.factId} [${f.topic}] (${(f.similarity * 100).toFixed(0)}% sim, ${(f.confidence * 100).toFixed(0)}% conf) ${f.fact}`
-    );
+    if (topFacts.length > 0) {
+      const lines = topFacts.map(f =>
+        `#${f.factId} [${f.topic}] (${(f.similarity * 100).toFixed(0)}% sim, ${(f.confidence * 100).toFixed(0)}% conf) ${f.fact}`
+      );
 
-    return {
-      content: [{ type: "text", text: `## Semantic Search Results (${topFacts.length})\n${lines.join("\n")}` }],
-      details: { count: topFacts.length, method: "semantic-vec" },
-    };
+      return {
+        content: [{ type: "text", text: `## Semantic Search Results (${topFacts.length})\n${lines.join("\n")}` }],
+        details: { count: topFacts.length, method: "semantic-vec" },
+      };
+    }
+  } catch {
+    // Vector search unavailable — fall through to O(n) fallback
   }
 
-  // Fallback: O(n) per-fact embedding (when sqlite-vec unavailable)
-  const activeFacts = db.prepare(
-    "SELECT id, topic, fact, confidence, status, scope FROM memory_facts WHERE status = 'active' ORDER BY confidence DESC LIMIT 100"
-  ).all() as Array<Pick<MemoryFact, "id" | "topic" | "fact" | "confidence" | "status" | "scope">>;
+  // Fallback: O(n) per-fact embedding
+  const activeFacts = await port.queryFacts({ status: "active", limit: 100 });
 
   const scored: Array<{ id: number; topic: string; fact: string; confidence: number; scope: string; similarity: number }> = [];
   for (const f of activeFacts) {
@@ -151,7 +145,7 @@ async function searchFacts(db: Database, params: Record<string, unknown>, limit:
   };
 }
 
-function addFact(db: Database, params: Record<string, unknown>): ToolResult {
+async function addFact(port: DatabasePort, params: Record<string, unknown>): Promise<ToolResult> {
   const fact = params.fact as string;
   const topic = (params.topic as string) ?? "learned_patterns";
   const confidence = (params.confidence as number) ?? 0.8;
@@ -162,16 +156,16 @@ function addFact(db: Database, params: Record<string, unknown>): ToolResult {
   }
 
   const hnswKey = `memfact:${topic}:${Date.now()}`;
-  const result = db.prepare(`
-    INSERT INTO memory_facts (topic, fact, confidence, source_type, scope, hnsw_key)
-    VALUES (?, ?, ?, 'manual', ?, ?)
-  `).run(topic, fact, Math.min(1, Math.max(0, confidence)), scope, hnswKey);
+  const factId = await port.storeFact({
+    topic,
+    fact,
+    confidence: Math.min(1, Math.max(0, confidence)),
+    sourceType: "manual",
+    scope,
+    hnswKey,
+  });
 
-  const factId = result.lastInsertRowid as number;
-
-  db.prepare(
-    "INSERT INTO memory_revisions (fact_id, revision_type, old_content, new_content, reason) VALUES (?, 'created', NULL, ?, 'manual add')"
-  ).run(factId, fact);
+  await port.storeRevision(factId, "created", null, fact, "manual add");
 
   return {
     content: [{ type: "text", text: `Created fact #${factId} [${topic}] (conf=${confidence}, scope=${scope})` }],
@@ -179,7 +173,7 @@ function addFact(db: Database, params: Record<string, unknown>): ToolResult {
   };
 }
 
-function editFact(db: Database, params: Record<string, unknown>): ToolResult {
+async function editFact(port: DatabasePort, params: Record<string, unknown>): Promise<ToolResult> {
   const factId = params.fact_id as number;
   const newFact = params.fact as string;
   const newConf = params.confidence as number | undefined;
@@ -191,18 +185,14 @@ function editFact(db: Database, params: Record<string, unknown>): ToolResult {
     return { content: [{ type: "text", text: "Error: fact parameter required for edit" }] };
   }
 
-  const existing = db.prepare("SELECT id, fact, confidence FROM memory_facts WHERE id = ?").get(factId) as any;
-  if (!existing) {
+  const existing = await port.queryFacts({ id: factId });
+  if (existing.length === 0) {
     return { content: [{ type: "text", text: `Error: fact #${factId} not found` }] };
   }
 
-  const conf = newConf !== undefined ? Math.min(1, Math.max(0, newConf)) : existing.confidence;
-  db.prepare("UPDATE memory_facts SET fact = ?, confidence = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-    .run(newFact, conf, factId);
-
-  db.prepare(
-    "INSERT INTO memory_revisions (fact_id, revision_type, old_content, new_content, reason) VALUES (?, 'manual_edit', ?, ?, 'manual edit')"
-  ).run(factId, existing.fact, newFact);
+  const conf = newConf !== undefined ? Math.min(1, Math.max(0, newConf)) : existing[0].confidence;
+  await port.updateFact(factId, { fact: newFact, confidence: conf });
+  await port.storeRevision(factId, "manual_edit", existing[0].fact, newFact, "manual edit");
 
   return {
     content: [{ type: "text", text: `Updated fact #${factId}: "${newFact}" (conf=${conf.toFixed(2)})` }],
@@ -210,24 +200,20 @@ function editFact(db: Database, params: Record<string, unknown>): ToolResult {
   };
 }
 
-function deleteFact(db: Database, params: Record<string, unknown>): ToolResult {
+async function deleteFact(port: DatabasePort, params: Record<string, unknown>): Promise<ToolResult> {
   const factId = params.fact_id as number;
   if (!factId) {
     return { content: [{ type: "text", text: "Error: fact_id parameter required" }] };
   }
 
-  const existing = db.prepare("SELECT id, fact FROM memory_facts WHERE id = ?").get(factId) as any;
-  if (!existing) {
+  const existing = await port.queryFacts({ id: factId });
+  if (existing.length === 0) {
     return { content: [{ type: "text", text: `Error: fact #${factId} not found` }] };
   }
 
   // Soft delete: set status to archived
-  db.prepare("UPDATE memory_facts SET status = 'archived', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-    .run(factId);
-
-  db.prepare(
-    "INSERT INTO memory_revisions (fact_id, revision_type, old_content, new_content, reason) VALUES (?, 'deleted', ?, NULL, 'manual delete (soft)')"
-  ).run(factId, existing.fact);
+  await port.updateFact(factId, { status: "archived" });
+  await port.storeRevision(factId, "deleted", existing[0].fact, null, "manual delete (soft)");
 
   return {
     content: [{ type: "text", text: `Archived fact #${factId} (soft delete)` }],
@@ -235,35 +221,21 @@ function deleteFact(db: Database, params: Record<string, unknown>): ToolResult {
   };
 }
 
-function getStatus(db: Database): ToolResult {
-  const total = (db.prepare("SELECT COUNT(*) as c FROM memory_facts").get() as any)?.c ?? 0;
-  const active = (db.prepare("SELECT COUNT(*) as c FROM memory_facts WHERE status = 'active'").get() as any)?.c ?? 0;
-  const contradicted = (db.prepare("SELECT COUNT(*) as c FROM memory_facts WHERE status = 'contradicted'").get() as any)?.c ?? 0;
-  const archived = (db.prepare("SELECT COUNT(*) as c FROM memory_facts WHERE status = 'archived'").get() as any)?.c ?? 0;
-  const stale = (db.prepare("SELECT COUNT(*) as c FROM memory_facts WHERE status = 'stale'").get() as any)?.c ?? 0;
-
-  const byTopic = db.prepare(
-    "SELECT topic, COUNT(*) as count, AVG(confidence) as avg_conf FROM memory_facts WHERE status = 'active' GROUP BY topic ORDER BY count DESC"
-  ).all() as Array<{ topic: string; count: number; avg_conf: number }>;
-
-  const lastExtraction = db.prepare(
-    "SELECT created_at FROM memory_revisions WHERE revision_type = 'created' ORDER BY created_at DESC LIMIT 1"
-  ).get() as { created_at: string } | undefined;
-
-  const revisionCount = (db.prepare("SELECT COUNT(*) as c FROM memory_revisions").get() as any)?.c ?? 0;
+async function getStatus(port: DatabasePort): Promise<ToolResult> {
+  const stats = await port.getFactStats();
 
   const lines = [
     `## Memory Bank Status`,
-    `Total facts: ${total} (active: ${active}, contradicted: ${contradicted}, archived: ${archived}, stale: ${stale})`,
-    `Total revisions: ${revisionCount}`,
-    `Last extraction: ${lastExtraction?.created_at ?? "never"}`,
+    `Total facts: ${stats.total} (active: ${stats.active}, contradicted: ${stats.contradicted}, archived: ${stats.archived}, stale: ${stats.stale})`,
+    `Total revisions: ${stats.revisionCount}`,
+    `Last extraction: ${stats.lastExtraction ?? "never"}`,
     ``,
     `### By Topic`,
-    ...byTopic.map(t => `- ${t.topic}: ${t.count} facts (avg conf: ${(t.avg_conf * 100).toFixed(0)}%)`),
+    ...stats.byTopic.map(t => `- ${t.topic}: ${t.count} facts (avg conf: ${(t.avg_conf * 100).toFixed(0)}%)`),
   ];
 
   return {
     content: [{ type: "text", text: lines.join("\n") }],
-    details: { total, active, contradicted, archived, stale, revisionCount },
+    details: { total: stats.total, active: stats.active, contradicted: stats.contradicted, archived: stats.archived, stale: stats.stale, revisionCount: stats.revisionCount },
   };
 }

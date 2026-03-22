@@ -1,7 +1,8 @@
 /**
  * memory-unified — OpenClaw Plugin
  *
- * Merges USMD SQLite skill memory with sqlite-vec vector search.
+ * Merges USMD SQLite skill memory with vector search (sqlite-vec or pgvector).
+ * Supports two backends: SQLite (local) and Postgres (remote).
  * Hooks: before_agent_start (RAG slim), on_tool_call (log vectors),
  *        agent_end (trajectory end with success/failure label).
  * CLI:   openclaw ingest <path> — chunk, auto-tag, embed, store.
@@ -13,10 +14,12 @@ import * as path from "node:path";
 // Config & types
 import { unifiedConfigSchema, type UnifiedMemoryConfig, type EntryType } from "./config";
 import type { PluginApi } from "./types";
+import type { DatabasePort } from "./db/port";
 
-// Database
+// Database backends
 import { UnifiedDBImpl } from "./db/sqlite";
-import { VectorManager } from "./db/vector-manager";
+import { SqlitePort } from "./db/sqlite-port";
+import { PostgresPort } from "./db/postgres";
 import { SqliteVecStore } from "./db/sqlite-vec";
 
 // Embedding
@@ -24,7 +27,6 @@ import { qwenSemanticSearch } from "./embedding/nemotron";
 
 // Memory Bank
 import { DEFAULT_TOPICS } from "./memory-bank/topics";
-import { runMaintenance, runDataCleanup, runPeriodicMaintenance } from "./memory-bank/maintenance";
 import { backfillFactEmbeddings } from "./memory-bank/backfill";
 import type { MemoryBankConfig } from "./memory-bank/types";
 
@@ -43,12 +45,111 @@ import { createMemoryBankManageTool } from "./tools/memory-bank-manage";
 import { chunkText, autoTag, summarize, extractKeywords } from "./utils/helpers";
 
 // ============================================================================
+// VectorManager adapter for DatabasePort
+// ============================================================================
+class PortVectorManager {
+  constructor(private port: DatabasePort, private logger: any) {}
+
+  isReady(): boolean { return true; }
+
+  async getCount(): Promise<number> {
+    return this.port.getEntryEmbeddingCount();
+  }
+
+  async addEntry(entryId: number, text: string): Promise<boolean> {
+    try {
+      const isEmbedded = await this.port.isEntryEmbedded(entryId);
+      if (isEmbedded) return true;
+
+      const entries = await this.port.queryEntries({ ids: [entryId] });
+      const entry = entries[0];
+      if (entry?.entry_type === 'tool') return false;
+
+      const { qwenEmbed, EMBED_DIM } = await import("./embedding/nemotron");
+      const embedding = await qwenEmbed(text);
+      if (!embedding || embedding.length !== EMBED_DIM) return false;
+
+      await this.port.storeEntryEmbedding(entryId, embedding, entry?.entry_type || '', text.slice(0, 500));
+      await this.port.markEntryAsEmbedded(entryId);
+      return true;
+    } catch (err) {
+      this.logger.warn?.('memory-unified: vector add failed:', String(err));
+      return false;
+    }
+  }
+
+  async search(query: string, topK = 5, excludeTypes: string[] = ['tool']): Promise<Array<{ entryId: number; distance: number }>> {
+    try {
+      const { qwenEmbed, EMBED_DIM } = await import("./embedding/nemotron");
+      const embedding = await qwenEmbed(query);
+      if (!embedding || embedding.length !== EMBED_DIM) return [];
+
+      const fetchK = excludeTypes.length > 0 ? topK + 10 : topK;
+      const results = await this.port.searchEntryEmbeddings(embedding, fetchK);
+
+      if (excludeTypes.length > 0) {
+        const excludeSet = new Set(excludeTypes);
+        const filtered: Array<{ entryId: number; distance: number }> = [];
+        for (const r of results) {
+          const entries = await this.port.queryEntries({ ids: [r.entryId] });
+          const entry = entries[0];
+          if (entry && !excludeSet.has(entry.entry_type)) {
+            filtered.push({ entryId: r.entryId, distance: r.distance });
+            if (filtered.length >= topK) break;
+          }
+        }
+        return filtered;
+      }
+
+      return results.slice(0, topK).map(r => ({ entryId: r.entryId, distance: r.distance }));
+    } catch (err) {
+      this.logger.warn?.('memory-unified: vector search failed:', String(err));
+      return [];
+    }
+  }
+
+  save(): void { /* no-op */ }
+
+  async bulkIndex(): Promise<void> {
+    try {
+      const unembedded = await this.port.getUnembeddedEntries(2000);
+      if (unembedded.length === 0) {
+        this.logger.info?.('memory-unified: bulk — all entries already embedded');
+        return;
+      }
+
+      this.logger.info?.(`memory-unified: bulk indexing ${unembedded.length} entries...`);
+      let indexed = 0;
+      const BATCH = 10;
+
+      for (let i = 0; i < unembedded.length; i += BATCH) {
+        const batch = unembedded.slice(i, i + BATCH);
+        const results = await Promise.all(
+          batch.map((e: any) => {
+            const text = e.summary || (e.content || '').slice(0, 500);
+            return text.length >= 10 ? this.addEntry(e.id, text) : Promise.resolve(false);
+          })
+        );
+        indexed += results.filter(Boolean).length;
+        if (i + BATCH < unembedded.length) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+
+      this.logger.info?.(`memory-unified: bulk complete — ${indexed}/${unembedded.length} embedded`);
+    } catch (err) {
+      this.logger.warn?.('memory-unified: bulk indexing failed:', String(err));
+    }
+  }
+}
+
+// ============================================================================
 // Plugin Definition
 // ============================================================================
 const memoryUnifiedPlugin = {
   id: "memory-unified",
-  name: "Memory Unified (USMD + sqlite-vec)",
-  description: "Unified memory: USMD SQLite for structured skills + sqlite-vec for semantic search. RAG slim, tool logging, trajectory tracking.",
+  name: "Memory Unified (USMD + vector search)",
+  description: "Unified memory: USMD + vector search (sqlite-vec or pgvector). RAG slim, tool logging, trajectory tracking.",
   kind: "memory" as const,
   configSchema: unifiedConfigSchema,
 
@@ -64,13 +165,11 @@ const memoryUnifiedPlugin = {
     const resolvedDbPath = api.resolvePath(cfg.dbPath);
     (api as any)._resolvedDbPath = resolvedDbPath;
 
-    let udb: UnifiedDBImpl;
-    try {
-      udb = new UnifiedDBImpl(resolvedDbPath, cfg.embeddingDim);
-    } catch (err) {
-      api.logger.error?.("memory-unified: DB init failed:", err);
-      throw err;
-    }
+    // ========================================================================
+    // Backend initialization (async, deferred to service start)
+    // ========================================================================
+    let port: DatabasePort;
+    let vectorManager: PortVectorManager;
 
     // Shared state across hooks
     const memoryState = {
@@ -81,91 +180,119 @@ const memoryUnifiedPlugin = {
       agentId: null as string | null,
     };
 
-    // ========================================================================
-    // sqlite-vec Vector Store + Vector Manager
-    // ========================================================================
-    let sqliteVecStore: SqliteVecStore | null = null;
-    let vectorManager: VectorManager | null = null;
-    try {
-      sqliteVecStore = new SqliteVecStore(udb.db, api.logger);
-      vectorManager = new VectorManager(udb.db, sqliteVecStore, api.logger);
-      api.logger.info?.(`memory-unified: vector manager ready (${vectorManager.getCount()} vectors, sqlite-vec: ${sqliteVecStore.count()})`);
-    } catch (vecErr) {
-      api.logger.warn?.('memory-unified: vector manager init failed, continuing without:', String(vecErr));
-    }
-
-    // ========================================================================
-    // Memory Bank: seed default topics
-    // ========================================================================
     const memoryBankConfig: MemoryBankConfig | undefined = cfg.memoryBank;
-    if (memoryBankConfig?.enabled) {
+
+    if (cfg.backend === "postgres") {
+      // === POSTGRES BACKEND ===
+      const pgPort = new PostgresPort(cfg.postgresUrl, cfg.embeddingDim);
+      port = pgPort;
+      vectorManager = new PortVectorManager(port, api.logger);
+
+      // Async init — runs table creation, column migration, agent map loading
+      pgPort.init()
+        .then(async () => {
+          api.logger.info?.(`memory-unified: Postgres backend initialized (${cfg.postgresUrl.replace(/:[^:@]+@/, ':***@')})`);
+
+          // Seed topics
+          if (memoryBankConfig?.enabled) {
+            try {
+              await port.seedTopics(DEFAULT_TOPICS);
+              api.logger.info?.("memory-unified: memory bank topics seeded");
+            } catch (e) { api.logger.warn?.("memory-unified: topic seed failed:", String(e)); }
+          }
+
+          // Archive phantom conversations
+          try {
+            const archived = await port.archiveConversations({ phantom: true });
+            if (archived > 0) api.logger.info?.(`memory-unified: archived ${archived} phantom conversations`);
+          } catch (e) { api.logger.warn?.("memory-unified: phantom cleanup failed:", String(e)); }
+
+          // Data cleanup
+          try {
+            const stats = await port.runDataCleanup();
+            if (stats.toolEntriesDeleted > 0 || stats.conversationsArchived > 0) {
+              api.logger.info?.(`memory-unified: cleanup — tools=${stats.toolEntriesDeleted}, convs=${stats.conversationsArchived}`);
+            }
+          } catch (e) { api.logger.warn?.("memory-unified: cleanup failed:", String(e)); }
+        })
+        .catch(err => api.logger.error?.("memory-unified: Postgres init failed:", String(err)));
+    } else {
+      // === SQLITE BACKEND (fallback) ===
+      let udb: UnifiedDBImpl;
       try {
-        udb.seedTopics(DEFAULT_TOPICS);
-        api.logger.info?.("memory-unified: memory bank topics seeded");
-      } catch (seedErr) {
-        api.logger.warn?.("memory-unified: topic seed failed:", String(seedErr));
+        udb = new UnifiedDBImpl(resolvedDbPath, cfg.embeddingDim);
+      } catch (err) {
+        api.logger.error?.("memory-unified: DB init failed:", err);
+        throw err;
       }
 
-      // Run maintenance on startup (TTL expiry + confidence decay)
+      let sqliteVecStore: SqliteVecStore | null = null;
       try {
-        const mResult = runMaintenance(udb.db, api.logger);
-        if (mResult.expired > 0 || mResult.decayed > 0) {
-          api.logger.info?.(`memory-unified: startup maintenance — expired=${mResult.expired}, decayed=${mResult.decayed}`);
+        sqliteVecStore = new SqliteVecStore(udb.db, api.logger);
+      } catch (e) {
+        api.logger.warn?.("memory-unified: sqlite-vec init failed:", String(e));
+      }
+
+      port = new SqlitePort(udb, sqliteVecStore);
+      vectorManager = new PortVectorManager(port, api.logger);
+
+      // Sync initialization for SQLite
+      if (memoryBankConfig?.enabled) {
+        try { udb.seedTopics(DEFAULT_TOPICS); } catch (e) { api.logger.warn?.("memory-unified: topic seed failed:", String(e)); }
+        try {
+          const { runMaintenance } = require("./memory-bank/maintenance");
+          const mResult = runMaintenance(udb.db, api.logger);
+          if (mResult.expired > 0 || mResult.decayed > 0) {
+            api.logger.info?.(`memory-unified: startup maintenance — expired=${mResult.expired}, decayed=${mResult.decayed}`);
+          }
+        } catch (e) { api.logger.warn?.("memory-unified: startup maintenance failed:", String(e)); }
+      }
+
+      // Clean up phantom conversations (sync)
+      try {
+        const cleanupResult = udb.db.prepare(`
+          UPDATE conversations SET status = 'archived'
+          WHERE status = 'active'
+            AND (topic LIKE 'You are a memory extraction system%'
+                 OR topic LIKE 'Extract facts:%')
+        `).run();
+        if (cleanupResult.changes > 0) {
+          api.logger.info?.(`memory-unified: archived ${cleanupResult.changes} phantom extraction conversations`);
         }
-      } catch (maintErr) {
-        api.logger.warn?.("memory-unified: startup maintenance failed:", String(maintErr));
-      }
+      } catch (e) { api.logger.warn?.("memory-unified: phantom cleanup failed:", String(e)); }
+
+      // Data cleanup (sync)
+      try {
+        const { runDataCleanup } = require("./memory-bank/maintenance");
+        const cleanupStats = runDataCleanup(udb.db, api.logger);
+        if (cleanupStats.toolEntriesDeleted > 0 || cleanupStats.stagingCleared > 0) {
+          api.logger.info?.(`memory-unified: cleanup — tool entries=${cleanupStats.toolEntriesDeleted}, staging=${cleanupStats.stagingCleared}`);
+        }
+      } catch (e) { api.logger.warn?.("memory-unified: cleanup failed:", String(e)); }
+
+      // Periodic maintenance (sync)
+      try {
+        const { runPeriodicMaintenance } = require("./memory-bank/maintenance");
+        runPeriodicMaintenance(udb.db, api.logger, resolvedDbPath);
+      } catch (e) { api.logger.warn?.("memory-unified: periodic maintenance failed:", String(e)); }
+
+      api.logger.info?.(`memory-unified: SQLite backend initialized (db: ${resolvedDbPath})`);
     }
 
-    // Clean up phantom conversations created by extraction loop
-    try {
-      const cleanupResult = udb.db.prepare(`
-        UPDATE conversations SET status = 'archived'
-        WHERE status = 'active'
-          AND (topic LIKE 'You are a memory extraction system%'
-               OR topic LIKE 'Extract facts:%')
-      `).run();
-      if (cleanupResult.changes > 0) {
-        api.logger.info?.(`memory-unified: archived ${cleanupResult.changes} phantom extraction conversations`);
-      }
-    } catch (cleanupErr) {
-      api.logger.warn?.("memory-unified: phantom conversation cleanup failed:", String(cleanupErr));
-    }
-
-    // One-time data cleanup: remove tool entries + staging blobs + vacuum
-    // Runs idempotently — safe on subsequent startups (nothing to delete after first run)
-    try {
-      const cleanupStats = runDataCleanup(udb.db, api.logger);
-      if (cleanupStats.toolEntriesDeleted > 0 || cleanupStats.stagingCleared > 0) {
-        api.logger.info?.(`memory-unified: cleanup — tool entries=${cleanupStats.toolEntriesDeleted}, staging=${cleanupStats.stagingCleared}, vacuumed=${cleanupStats.vacuumed}`);
-      }
-    } catch (cleanupErr) {
-      api.logger.warn?.("memory-unified: data cleanup failed:", String(cleanupErr));
-    }
-
-    // Run periodic maintenance (TTL, decay, purge old tools, archive stale convs)
-    try {
-      runPeriodicMaintenance(udb.db, api.logger, resolvedDbPath);
-    } catch (pmErr) {
-      api.logger.warn?.("memory-unified: periodic maintenance failed:", String(pmErr));
-    }
-
-    api.logger.info?.(`memory-unified: initialized (db: ${resolvedDbPath})`);
+    api.logger.info?.(`memory-unified: initialized (backend: ${cfg.backend})`);
 
     // ========================================================================
     // Hook 1: before_agent_start → RAG slim
     // ========================================================================
     if (cfg.ragSlim) {
       const ragHook = createRagInjectionHook({
-        udb,
-        ruflo: null,
+        port,
         lanceManager: vectorManager,
         cfg,
         memoryState,
         qwenSemanticSearch,
         extractKeywords,
         memoryBankConfig,
-        factVecSearch: udb,
       });
 
       api.on("before_agent_start", async (event) => {
@@ -178,8 +305,7 @@ const memoryUnifiedPlugin = {
     // ========================================================================
     if (cfg.logToolCalls) {
       const toolCallHook = createToolCallLogHook({
-        udb,
-        ruflo: null,
+        port,
         lanceManager: vectorManager,
         cfg,
         memoryState,
@@ -195,13 +321,11 @@ const memoryUnifiedPlugin = {
     // ========================================================================
     if (cfg.trajectoryTracking) {
       const agentEndHook = createAgentEndHook({
-        udb,
-        ruflo: null,
+        port,
         lanceManager: vectorManager,
         cfg,
         memoryState,
         memoryBankConfig,
-        embeddingStore: udb,
       });
 
       api.on("agent_end", async (event) => {
@@ -210,13 +334,13 @@ const memoryUnifiedPlugin = {
     }
 
     // ========================================================================
-    // Tools: Register all four tools
+    // Tools: Register all tools
     // ========================================================================
-    api.registerTool(createUnifiedSearchTool(udb, vectorManager), { name: "unified_search" });
-    api.registerTool(createUnifiedStoreTool(udb, null, vectorManager), { name: "unified_store" });
-    api.registerTool(createUnifiedConversationsTool(udb), { name: "unified_conversations" });
-    api.registerTool(createUnifiedIndexFilesTool(udb), { name: "unified_index_files" });
-    api.registerTool(createMemoryBankManageTool(udb.db, udb), { name: "memory_bank_manage" });
+    api.registerTool(createUnifiedSearchTool(port, vectorManager), { name: "unified_search" });
+    api.registerTool(createUnifiedStoreTool(port, vectorManager), { name: "unified_store" });
+    api.registerTool(createUnifiedConversationsTool(port), { name: "unified_conversations" });
+    api.registerTool(createUnifiedIndexFilesTool(port), { name: "unified_index_files" });
+    api.registerTool(createMemoryBankManageTool(port), { name: "memory_bank_manage" });
 
     // ========================================================================
     // CLI: openclaw ingest <path>
@@ -251,7 +375,6 @@ const memoryUnifiedPlugin = {
             const ext = path.extname(file).slice(1);
             const chunks = chunkText(text, chunkSize);
 
-            // Auto-detect entry type
             let entryType: EntryType = (opts.type as EntryType) ?? "history";
             if (!opts.type) {
               if (/skill/i.test(file) || ext === "md") entryType = "skill";
@@ -264,7 +387,7 @@ const memoryUnifiedPlugin = {
               const sum = summarize(chunk);
               const hnswKey = `ingest:${path.basename(file)}:${totalChunks}`;
 
-              udb.storeEntry({
+              await port.storeEntry({
                 entryType,
                 tags: tags.join(","),
                 content: chunk,
@@ -289,23 +412,19 @@ const memoryUnifiedPlugin = {
     api.registerService({
       id: "memory-unified",
       start: () => {
-        api.logger.info?.(`memory-unified: service started (db: ${resolvedDbPath})`);
-        // Kick off bulk indexing in background (fire and forget)
-        if (vectorManager?.isReady()) {
-          vectorManager.bulkIndex().catch(err => api.logger.warn?.("memory-unified: bulk index failed:", String(err)));
-        }
+        api.logger.info?.(`memory-unified: service started (backend: ${cfg.backend})`);
+        // Kick off bulk indexing in background
+        vectorManager.bulkIndex().catch(err => api.logger.warn?.("memory-unified: bulk index failed:", String(err)));
         // Backfill memory_facts_vec for existing facts missing embeddings
         if (memoryBankConfig?.enabled) {
-          backfillFactEmbeddings(udb, api.logger).catch(err =>
+          backfillFactEmbeddings(port, api.logger).catch(err =>
             api.logger.warn?.("memory-unified: fact backfill failed:", String(err))
           );
         }
       },
       stop: () => {
-        if (vectorManager?.isReady()) {
-          vectorManager.save();
-        }
-        udb.close();
+        vectorManager.save();
+        port.close().catch(() => {});
         api.logger.info?.("memory-unified: service stopped");
       },
     });

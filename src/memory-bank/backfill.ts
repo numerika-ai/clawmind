@@ -1,25 +1,21 @@
 /**
  * memory-bank/backfill.ts — Re-embed existing facts that lack vector embeddings
  *
- * Called on startup to ensure all active facts are searchable via sqlite-vec.
+ * Called on startup to ensure all active facts are searchable via sqlite-vec / pgvector.
  */
 
-import { embed, embeddingToBuffer } from "../embedding/nemotron";
-
-interface BackfillDB {
-  getFactsWithoutEmbeddings(): Array<{ id: number; fact: string }>;
-  storeFactEmbedding(factId: number, embeddingBuf: Buffer): void;
-}
+import { embed } from "../embedding/nemotron";
+import type { DatabasePort } from "../db/port";
 
 /**
  * Backfill embeddings for all active facts missing from memory_facts_vec.
  * Runs in the background — does not block startup.
  */
 export async function backfillFactEmbeddings(
-  db: BackfillDB,
+  port: DatabasePort,
   logger: { info?(...args: unknown[]): void; warn?(...args: unknown[]): void },
 ): Promise<number> {
-  const missing = db.getFactsWithoutEmbeddings();
+  const missing = await port.getFactsWithoutEmbeddings();
   if (missing.length === 0) return 0;
 
   logger.info?.(`memory-bank: backfilling ${missing.length} facts without embeddings...`);
@@ -29,7 +25,7 @@ export async function backfillFactEmbeddings(
     try {
       const emb = await embed(fact.fact, "passage");
       if (emb) {
-        db.storeFactEmbedding(fact.id, embeddingToBuffer(emb));
+        await port.storeFactEmbedding(fact.id, emb);
         count++;
       }
     } catch {

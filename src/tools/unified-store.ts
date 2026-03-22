@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
-import type { ToolDef, ToolResult, RufloHNSW, UnifiedDB } from "../types";
+import type { ToolDef, ToolResult } from "../types";
+import type { DatabasePort } from "../db/port";
 import type { EntryType } from "../config";
 import { autoTag, summarize, extractAgentFromSessionKey } from "../utils/helpers";
 
@@ -10,14 +11,13 @@ interface NativeHnswManager {
 }
 
 export function createUnifiedStoreTool(
-  udb: UnifiedDB, 
-  ruflo: RufloHNSW | null,
+  port: DatabasePort,
   hnswManager: NativeHnswManager | null
 ): ToolDef {
   return {
     name: "unified_store",
     label: "Unified Memory Store",
-    description: "Store an entry in both USMD SQLite and Ruflo HNSW. Auto-tags and summarizes.",
+    description: "Store an entry in unified memory. Auto-tags and summarizes.",
     parameters: Type.Object({
       content: Type.String({ description: "Content to store" }),
       type: Type.Optional(Type.String({ description: "Entry type: skill/protocol/config/history/tool/result/task (default: history)" })),
@@ -36,7 +36,7 @@ export function createUnifiedStoreTool(
       const summary = summarize(content);
       const hnswKey = `${entryType}:${Date.now()}:${randomUUID().slice(0, 6)}`;
 
-      const entryId = udb.storeEntry({
+      const entryId = await port.storeEntry({
         entryType,
         tags: tags.join(","),
         content,
@@ -45,10 +45,6 @@ export function createUnifiedStoreTool(
         hnswKey,
         agentId,
       });
-
-      if (ruflo) {
-        await ruflo.store(hnswKey, { content: content.slice(0, 2000), summary, tags, entryType }, { tags, namespace: "unified" });
-      }
 
       // Index in native HNSW (fire and forget)
       if (hnswManager?.isReady()) {

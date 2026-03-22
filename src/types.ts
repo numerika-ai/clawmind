@@ -57,3 +57,6 @@ export interface UnifiedDB {
   close(): void;
   db: import("better-sqlite3").Database;
 }
+
+// Re-export DatabasePort for convenience
+export type { DatabasePort } from "./db/port";

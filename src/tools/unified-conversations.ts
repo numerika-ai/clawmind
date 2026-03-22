@@ -1,7 +1,8 @@
 import { Type } from "@sinclair/typebox";
-import type { ToolDef, ToolResult, UnifiedDB } from "../types";
+import type { ToolDef, ToolResult } from "../types";
+import type { DatabasePort } from "../db/port";
 
-export function createUnifiedConversationsTool(udb: UnifiedDB): ToolDef {
+export function createUnifiedConversationsTool(port: DatabasePort): ToolDef {
   return {
     name: "unified_conversations",
     label: "Conversation Threads",
@@ -18,30 +19,12 @@ export function createUnifiedConversationsTool(udb: UnifiedDB): ToolDef {
       const query = (params.query as string) || '';
       const includeDetails = (params.details as boolean) || false;
 
-      let sql = 'SELECT * FROM conversations WHERE 1=1';
-      const sqlParams: any[] = [];
-
-      if (status !== 'all') {
-        sql += ' AND status = ?';
-        sqlParams.push(status);
-      }
-      if (query) {
-        sql += ' AND (topic LIKE ? OR tags LIKE ? OR summary LIKE ?)';
-        const q = `%${query}%`;
-        sqlParams.push(q, q, q);
-      }
-      sql += ' ORDER BY updated_at DESC LIMIT ?';
-      sqlParams.push(limit);
-
-      const conversations = udb.db.prepare(sql).all(...sqlParams) as any[];
-
-      if (includeDetails) {
-        for (const conv of conversations) {
-          conv.messages = udb.db.prepare(
-            'SELECT role, content_summary, has_decision, has_action, timestamp FROM conversation_messages WHERE conversation_id = ? ORDER BY timestamp DESC LIMIT 20'
-          ).all(conv.id);
-        }
-      }
+      const conversations = await port.queryConversations({
+        status: status === 'all' ? undefined : status,
+        query: query || undefined,
+        limit,
+        includeMessages: includeDetails,
+      });
 
       const text = JSON.stringify(conversations, null, 2);
       return {

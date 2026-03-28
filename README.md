@@ -249,6 +249,56 @@ v2.0 creates these tables automatically in the `openclaw` schema:
 - **`agent_entity_mentions`** — entity ↔ entry linking
 - **`skill_embeddings`** — persistent skill embedding cache
 
+## Live Dashboard
+
+Built-in web dashboard for visualizing your agent's knowledge graph and memory system.
+
+![Dashboard](dashboard/screenshot.png)
+
+### Quick Start
+
+```bash
+# Install dependencies
+pip3 install flask flask-cors psycopg2-binary
+
+# Run the API server
+cd dashboard/
+python3 api.py
+# → http://localhost:8091/
+```
+
+### Systemd Service (auto-start)
+
+```bash
+cp dashboard/memory-graph-api.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now memory-graph-api.service
+```
+
+### Features
+
+- **🔵 Knowledge Graph** — interactive vis.js network: entities as nodes (colored by type), relations as edges, click to inspect
+- **📋 Facts Table** — sortable memory bank with confidence bars, tier badges (🔥hot/🟡warm/❄️cold), topic filters
+- **📅 Timeline** — chronological event stream from topic events, fact creation, entity discovery
+- **📊 Stats Bar** — live counts: entities, relations, mentions, facts, entries, patterns
+- **🔍 Search** — filter/highlight nodes in graph by name or type
+- **⌨️ Keyboard shortcuts** — `1`/`2`/`3` switch tabs, `R` refresh, `F` fit graph
+- **🔄 Auto-refresh** — updates every 30 seconds with connection status indicator
+
+### API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/graph` | Knowledge graph nodes + edges |
+| `GET /api/facts` | Memory Bank facts with tier info |
+| `GET /api/stats` | System-wide statistics |
+| `GET /api/timeline` | Chronological events |
+| `GET /api/entity/<id>` | Entity detail with relations + mentions |
+
+### Entity Backfill
+
+Entities are automatically extracted from new conversations. To backfill existing data, the plugin runs an entity backfill job on gateway startup — processing facts and entries that don't yet have entity mentions linked.
+
 ## Development
 
 ```bash

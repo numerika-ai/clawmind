@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memory Graph — OpenClaw Knowledge Dashboard</title>
+    <script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+    <script src="https://unpkg.com/vis-timeline@7.7.3/standalone/umd/vis-timeline-graph2d.min.js"></script>
+    <link href="https://unpkg.com/vis-timeline@7.7.3/styles/vis-timeline-graph2d.min.css" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        /* --- Header / Stats Bar --- */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 16px;
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+            height: 48px;
+            flex-shrink: 0;
+        }
+        .header h1 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #e94560;
+            white-space: nowrap;
+        }
+        .stats-bar {
+            display: flex;
+            gap: 16px;
+            font-size: 12px;
+        }
+        .stat {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .stat-value {
+            font-weight: 700;
+            color: #e94560;
+            font-size: 14px;
+        }
+        .stat-label { color: #8899aa; }
+
+        /* --- Tabs --- */
+        .tabs {
+            display: flex;
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+            height: 36px;
+            flex-shrink: 0;
+        }
+        .tab {
+            padding: 8px 24px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #8899aa;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab:hover { color: #e0e0e0; }
+        .tab.active {
+            color: #e94560;
+            border-bottom-color: #e94560;
+        }
+
+        /* --- Main Layout --- */
+        .main {
+            display: flex;
+            height: calc(100vh - 84px);
+        }
+        .graph-container {
+            flex: 1;
+            position: relative;
+        }
+        #network, #timeline-container {
+            width: 100%;
+            height: 100%;
+        }
+        .tab-content { display: none; height: 100%; }
+        .tab-content.active { display: flex; }
+
+        /* --- Search --- */
+        .search-box {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            z-index: 10;
+        }
+        .search-box input {
+            background: #16213e;
+            border: 1px solid #0f3460;
+            color: #e0e0e0;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            width: 240px;
+            outline: none;
+        }
+        .search-box input:focus {
+            border-color: #e94560;
+        }
+        .search-box input::placeholder { color: #556677; }
+
+        /* --- Detail Panel --- */
+        .detail-panel {
+            width: 320px;
+            background: #16213e;
+            border-left: 1px solid #0f3460;
+            overflow-y: auto;
+            padding: 16px;
+            display: none;
+            flex-shrink: 0;
+        }
+        .detail-panel.visible { display: block; }
+        .detail-panel h2 {
+            font-size: 16px;
+            color: #e94560;
+            margin-bottom: 12px;
+        }
+        .detail-panel .close-btn {
+            float: right;
+            cursor: pointer;
+            color: #8899aa;
+            font-size: 18px;
+        }
+        .detail-panel .close-btn:hover { color: #e94560; }
+        .detail-section {
+            margin-bottom: 16px;
+        }
+        .detail-section h3 {
+            font-size: 12px;
+            text-transform: uppercase;
+            color: #8899aa;
+            margin-bottom: 6px;
+            letter-spacing: 0.5px;
+        }
+        .detail-section .value {
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            margin: 2px;
+        }
+        .badge-person { background: #4CAF50; color: #fff; }
+        .badge-organization { background: #2196F3; color: #fff; }
+        .badge-project { background: #FF9800; color: #fff; }
+        .badge-tool { background: #9C27B0; color: #fff; }
+        .badge-infrastructure { background: #607D8B; color: #fff; }
+        .badge-concept { background: #795548; color: #fff; }
+
+        .relation-item {
+            padding: 6px 0;
+            border-bottom: 1px solid #0f3460;
+            font-size: 12px;
+        }
+        .relation-item:last-child { border-bottom: none; }
+        .relation-arrow { color: #e94560; }
+        .fact-item {
+            padding: 8px;
+            background: #1a1a2e;
+            border-radius: 6px;
+            margin-bottom: 6px;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        .fact-topic {
+            color: #e94560;
+            font-weight: 600;
+            font-size: 11px;
+        }
+        .fact-confidence {
+            color: #8899aa;
+            font-size: 10px;
+        }
+
+        /* --- Facts Tab --- */
+        .facts-table {
+            width: 100%;
+            overflow-y: auto;
+            padding: 16px;
+        }
+        .facts-grid {
+            display: grid;
+            gap: 8px;
+        }
+        .fact-card {
+            background: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 12px;
+        }
+        .fact-card-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+        }
+
+        /* --- Timeline --- */
+        .vis-timeline {
+            background: #1a1a2e !important;
+            border: none !important;
+        }
+        .vis-item {
+            background: #16213e !important;
+            border-color: #0f3460 !important;
+            color: #e0e0e0 !important;
+            font-size: 11px !important;
+            border-radius: 4px !important;
+        }
+        .vis-item.vis-selected {
+            border-color: #e94560 !important;
+        }
+        .vis-time-axis .vis-text {
+            color: #8899aa !important;
+            font-size: 11px !important;
+        }
+        .vis-panel.vis-bottom, .vis-panel.vis-center,
+        .vis-panel.vis-top, .vis-panel.vis-left, .vis-panel.vis-right {
+            border-color: #0f3460 !important;
+        }
+
+        /* --- Legend --- */
+        .legend {
+            position: absolute;
+            bottom: 12px;
+            left: 12px;
+            background: #16213ecc;
+            padding: 8px 12px;
+            border-radius: 6px;
+            display: flex;
+            gap: 12px;
+            font-size: 11px;
+            z-index: 10;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        /* --- Refresh indicator --- */
+        .refresh-indicator {
+            font-size: 11px;
+            color: #556677;
+        }
+
+        /* --- Responsive --- */
+        @media (max-width: 768px) {
+            .stats-bar { display: none; }
+            .detail-panel { width: 100%; position: absolute; right: 0; top: 0; height: 100%; z-index: 20; }
+            .search-box input { width: 180px; }
+            .legend { flex-wrap: wrap; gap: 6px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Memory Graph</h1>
+    <div class="stats-bar" id="stats-bar">
+        <div class="stat"><span class="stat-value" id="st-entities">—</span><span class="stat-label">entities</span></div>
+        <div class="stat"><span class="stat-value" id="st-relations">—</span><span class="stat-label">relations</span></div>
+        <div class="stat"><span class="stat-value" id="st-facts">—</span><span class="stat-label">facts</span></div>
+        <div class="stat"><span class="stat-value" id="st-entries">—</span><span class="stat-label">entries</span></div>
+        <div class="stat"><span class="stat-value" id="st-patterns">—</span><span class="stat-label">patterns</span></div>
+        <span class="refresh-indicator" id="refresh-time"></span>
+    </div>
+</div>
+
+<div class="tabs">
+    <div class="tab active" data-tab="graph">Knowledge Graph</div>
+    <div class="tab" data-tab="timeline">Timeline</div>
+</div>
+
+<div class="main">
+    <!-- Knowledge Graph Tab -->
+    <div class="tab-content active" id="tab-graph">
+        <div class="graph-container">
+            <div class="search-box">
+                <input type="text" id="search" placeholder="Search entities...">
+            </div>
+            <div id="network"></div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background:#4CAF50"></div>Person</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#2196F3"></div>Organization</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#FF9800"></div>Project</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#9C27B0"></div>Tool</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#607D8B"></div>Infrastructure</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#795548"></div>Concept</div>
+            </div>
+        </div>
+        <div class="detail-panel" id="detail-panel">
+            <span class="close-btn" id="close-detail">&times;</span>
+            <div id="detail-content"></div>
+        </div>
+    </div>
+
+    <!-- Timeline Tab -->
+    <div class="tab-content" id="tab-timeline">
+        <div id="timeline-container"></div>
+    </div>
+</div>
+
+<script>
+const API_BASE = window.location.hostname === '' || window.location.protocol === 'file:'
+    ? 'http://localhost:8091'
+    : `${window.location.protocol}//${window.location.hostname}:8091`;
+const REFRESH_INTERVAL = 30000;
+const TYPE_COLORS = {
+    person: '#4CAF50',
+    organization: '#2196F3',
+    project: '#FF9800',
+    tool: '#9C27B0',
+    infrastructure: '#607D8B',
+    concept: '#795548'
+};
+
+let network = null;
+let timeline = null;
+let nodesDataset = null;
+let edgesDataset = null;
+let allNodes = [];
+
+// --- Tabs ---
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+        if (tab.dataset.tab === 'timeline' && !timeline) loadTimeline();
+    });
+});
+
+// --- Graph ---
+function initNetwork() {
+    const container = document.getElementById('network');
+    nodesDataset = new vis.DataSet([]);
+    edgesDataset = new vis.DataSet([]);
+
+    const options = {
+        nodes: {
+            shape: 'dot',
+            font: { color: '#e0e0e0', size: 12, face: 'Segoe UI' },
+            borderWidth: 2,
+            shadow: { enabled: true, color: 'rgba(0,0,0,0.3)', size: 8 }
+        },
+        edges: {
+            color: { color: '#334455', highlight: '#e94560', hover: '#556677' },
+            font: { color: '#8899aa', size: 9, face: 'Segoe UI', strokeWidth: 0 },
+            smooth: { type: 'continuous', roundness: 0.3 },
+            width: 1.5
+        },
+        physics: {
+            solver: 'barnesHut',
+            barnesHut: {
+                gravitationalConstant: -3000,
+                centralGravity: 0.2,
+                springLength: 150,
+                springConstant: 0.04,
+                damping: 0.15
+            },
+            stabilization: { iterations: 100, fit: true }
+        },
+        interaction: {
+            hover: true,
+            tooltipDelay: 200,
+            navigationButtons: false,
+            keyboard: false
+        },
+        groups: Object.fromEntries(
+            Object.entries(TYPE_COLORS).map(([k, v]) => [k, { color: { background: v, border: v, highlight: { background: v, border: '#e94560' } } }])
+        )
+    };
+
+    network = new vis.Network(container, { nodes: nodesDataset, edges: edgesDataset }, options);
+    network.on('click', onNodeClick);
+}
+
+async function loadGraph() {
+    try {
+        const resp = await fetch(`${API_BASE}/api/graph`);
+        const data = await resp.json();
+        allNodes = data.nodes;
+
+        const nodes = data.nodes.map(n => ({
+            id: n.id,
+            label: n.label,
+            group: n.group || n.type,
+            size: n.size,
+            title: `${n.label} (${n.type})\n${n.mentions} mentions`
+        }));
+
+        const edges = data.edges.map(e => ({
+            id: e.id,
+            from: e.from,
+            to: e.to,
+            label: e.label,
+            title: `${e.label} (${(e.confidence * 100).toFixed(0)}%)`
+        }));
+
+        nodesDataset.clear();
+        edgesDataset.clear();
+        nodesDataset.add(nodes);
+        edgesDataset.add(edges);
+    } catch (e) {
+        console.error('Failed to load graph:', e);
+    }
+}
+
+async function onNodeClick(params) {
+    if (!params.nodes.length) {
+        document.getElementById('detail-panel').classList.remove('visible');
+        return;
+    }
+    const nodeId = params.nodes[0];
+    try {
+        const resp = await fetch(`${API_BASE}/api/entity/${nodeId}`);
+        const entity = await resp.json();
+        showDetail(entity);
+    } catch (e) {
+        console.error('Failed to load entity:', e);
+    }
+}
+
+function showDetail(entity) {
+    const panel = document.getElementById('detail-panel');
+    const content = document.getElementById('detail-content');
+    const typeClass = `badge-${entity.entity_type || 'concept'}`;
+
+    let html = `
+        <h2>${entity.name}</h2>
+        <div class="detail-section">
+            <h3>Type</h3>
+            <span class="badge ${typeClass}">${entity.entity_type}</span>
+        </div>`;
+
+    if (entity.aliases && entity.aliases.length) {
+        html += `<div class="detail-section">
+            <h3>Aliases</h3>
+            <div class="value">${entity.aliases.join(', ')}</div>
+        </div>`;
+    }
+
+    if (entity.relations && entity.relations.length) {
+        html += `<div class="detail-section"><h3>Relations (${entity.relations.length})</h3>`;
+        entity.relations.forEach(r => {
+            const isSrc = r.source_entity_id === entity.id;
+            const other = isSrc ? r.target_name : r.source_name;
+            const otherType = isSrc ? r.target_type : r.source_type;
+            const arrow = isSrc ? '→' : '←';
+            html += `<div class="relation-item">
+                <span class="relation-arrow">${arrow}</span>
+                <strong>${r.relation_type}</strong>
+                <span class="badge badge-${otherType || 'concept'}">${other}</span>
+            </div>`;
+        });
+        html += `</div>`;
+    }
+
+    if (entity.linked_facts && entity.linked_facts.length) {
+        html += `<div class="detail-section"><h3>Linked Facts</h3>`;
+        entity.linked_facts.forEach(f => {
+            html += `<div class="fact-item">
+                <div class="fact-topic">${f.topic || 'general'}</div>
+                <div>${f.fact}</div>
+                <div class="fact-confidence">confidence: ${(f.confidence * 100).toFixed(0)}% · tier: ${f.tier || '—'}</div>
+            </div>`;
+        });
+        html += `</div>`;
+    }
+
+    content.innerHTML = html;
+    panel.classList.add('visible');
+}
+
+document.getElementById('close-detail').addEventListener('click', () => {
+    document.getElementById('detail-panel').classList.remove('visible');
+});
+
+// --- Search ---
+document.getElementById('search').addEventListener('input', (e) => {
+    const query = e.target.value.toLowerCase().trim();
+    if (!query) {
+        // Reset: pokaż wszystkie węzły
+        nodesDataset.forEach(n => {
+            nodesDataset.update({ id: n.id, opacity: 1.0, font: { color: '#e0e0e0' } });
+        });
+        return;
+    }
+
+    const matchIds = new Set();
+    allNodes.forEach(n => {
+        const match = n.label.toLowerCase().includes(query) ||
+            (n.aliases || []).some(a => a.toLowerCase().includes(query));
+        if (match) matchIds.add(n.id);
+    });
+
+    nodesDataset.forEach(n => {
+        const isMatch = matchIds.has(n.id);
+        nodesDataset.update({
+            id: n.id,
+            opacity: isMatch ? 1.0 : 0.15,
+            font: { color: isMatch ? '#ffffff' : '#33445566' }
+        });
+    });
+});
+
+// --- Stats ---
+async function loadStats() {
+    try {
+        const resp = await fetch(`${API_BASE}/api/stats`);
+        const s = await resp.json();
+        document.getElementById('st-entities').textContent = s.entities || 0;
+        document.getElementById('st-relations').textContent = s.relations || 0;
+        document.getElementById('st-facts').textContent = s.facts || 0;
+        document.getElementById('st-entries').textContent = s.entries || 0;
+        document.getElementById('st-patterns').textContent = s.patterns || 0;
+        document.getElementById('refresh-time').textContent =
+            `Updated ${new Date().toLocaleTimeString()}`;
+    } catch (e) {
+        console.error('Failed to load stats:', e);
+    }
+}
+
+// --- Timeline ---
+async function loadTimeline() {
+    try {
+        const resp = await fetch(`${API_BASE}/api/timeline`);
+        const data = await resp.json();
+
+        const items = data.events
+            .filter(e => e.timestamp)
+            .map((e, i) => ({
+                id: i,
+                content: `<b>${e.topic || e.type}</b>: ${(e.content || '').substring(0, 80)}`,
+                start: new Date(e.timestamp),
+                type: 'box',
+                className: `event-${e.type}`
+            }));
+
+        const container = document.getElementById('timeline-container');
+        timeline = new vis.Timeline(container, new vis.DataSet(items), {
+            height: '100%',
+            showCurrentTime: true,
+            zoomMin: 1000 * 60 * 60,        // 1 hour
+            zoomMax: 1000 * 60 * 60 * 24 * 90, // 90 days
+            orientation: 'top',
+            stack: true,
+            margin: { item: 4 }
+        });
+    } catch (e) {
+        console.error('Failed to load timeline:', e);
+    }
+}
+
+// --- Init ---
+initNetwork();
+loadGraph();
+loadStats();
+
+// Auto-refresh co 30 sekund
+setInterval(() => {
+    loadGraph();
+    loadStats();
+    if (timeline) loadTimeline();
+}, REFRESH_INTERVAL);
+</script>
+</body>
+</html>

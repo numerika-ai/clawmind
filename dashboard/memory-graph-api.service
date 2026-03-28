@@ -1,0 +1,16 @@
+[Unit]
+Description=Memory Graph Dashboard API (Flask, port 8091)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=tank
+WorkingDirectory=/home/tank/.openclaw/extensions/memory-unified/dashboard
+Environment=DATABASE_URL=postgresql://openclaw:OpenClaw2026!@localhost:5432/openclaw_platform
+Environment=PORT=8091
+ExecStart=/usr/bin/python3 api.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

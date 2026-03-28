@@ -480,6 +480,12 @@ const memoryUnifiedPlugin = {
           backfillFactEmbeddings(port, api.logger).catch(err =>
             api.logger.warn?.("memory-unified: fact backfill failed:", String(err))
           );
+          // v2.0: Entity backfill — extract entities from existing facts & entries
+          import("./entity/backfill").then(({ backfillEntitiesFromFacts, backfillEntitiesFromEntries }) => {
+            backfillEntitiesFromFacts(port, memoryBankConfig, api.logger)
+              .then(() => backfillEntitiesFromEntries(port, memoryBankConfig, api.logger))
+              .catch(err => api.logger.warn?.("memory-unified: entity backfill failed:", String(err)));
+          }).catch(() => {});
         }
       },
       stop: () => {

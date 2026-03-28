@@ -180,6 +180,87 @@ export class PostgresPort implements DatabasePort {
       )
     `);
 
+    // Topic registry & timeline
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS openclaw.topic_registry (
+        slug TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        aliases TEXT[] DEFAULT '{}',
+        description TEXT,
+        first_seen TIMESTAMPTZ DEFAULT NOW(),
+        last_seen TIMESTAMPTZ DEFAULT NOW(),
+        event_count INTEGER DEFAULT 0,
+        trend_score REAL DEFAULT 0.0
+      )
+    `);
+
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS openclaw.topic_timeline (
+        id SERIAL PRIMARY KEY,
+        topic_slug TEXT NOT NULL REFERENCES openclaw.topic_registry(slug),
+        topic_label TEXT NOT NULL,
+        aliases TEXT[] DEFAULT '{}',
+        event_type TEXT NOT NULL,
+        event_id INTEGER,
+        event_summary TEXT,
+        agent_id UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_topic_timeline_slug ON openclaw.topic_timeline(topic_slug)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_topic_timeline_created ON openclaw.topic_timeline(created_at DESC)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_topic_timeline_slug_created ON openclaw.topic_timeline(topic_slug, created_at DESC)`);
+
+    // Entity Resolution tables (v2.0)
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS openclaw.agent_entities (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        entity_type TEXT NOT NULL DEFAULT 'concept',
+        aliases TEXT[] DEFAULT '{}',
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_entity_name ON openclaw.agent_entities USING gin (name gin_trgm_ops)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_entity_type ON openclaw.agent_entities(entity_type)`);
+
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS openclaw.agent_entity_relations (
+        id BIGSERIAL PRIMARY KEY,
+        source_entity_id BIGINT NOT NULL REFERENCES openclaw.agent_entities(id),
+        target_entity_id BIGINT NOT NULL REFERENCES openclaw.agent_entities(id),
+        relation_type TEXT NOT NULL,
+        confidence REAL DEFAULT 0.8,
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_entity_rel_source ON openclaw.agent_entity_relations(source_entity_id)`);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_entity_rel_target ON openclaw.agent_entity_relations(target_entity_id)`);
+
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS openclaw.agent_entity_mentions (
+        id BIGSERIAL PRIMARY KEY,
+        entity_id BIGINT NOT NULL REFERENCES openclaw.agent_entities(id),
+        entry_id BIGINT,
+        fact_id BIGINT,
+        context_snippet TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await this.pool.query(`CREATE INDEX IF NOT EXISTS idx_entity_mention_entity ON openclaw.agent_entity_mentions(entity_id)`);
+
+    // Skill embedding cache (v2.0 — P7)
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS openclaw.agent_skill_embeddings (
+        skill_name TEXT PRIMARY KEY,
+        embedding vector(${this.embeddingDim}),
+        embedded_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
     // Seed initial aliases
     const seedAliases: Array<{ alias: string; canonical: string; related: string[] }> = [
       { alias: "PAI", canonical: "Personal AI", related: ["Claude Code PAI", "PAI framework", "TELOS system", "Pi AI"] },
@@ -222,6 +303,9 @@ export class PostgresPort implements DatabasePort {
       { name: "source_summary", def: "TEXT" },
       { name: "access_count", def: "INTEGER DEFAULT 0" },
       { name: "last_accessed_at", def: "TIMESTAMPTZ" },
+      { name: "repeated_count", def: "INTEGER DEFAULT 0" },
+      { name: "tier", def: "TEXT DEFAULT 'warm'" },      // v2.0 — hot/warm/cold
+      { name: "strength", def: "REAL DEFAULT 1.0" },     // v2.0 — Ebbinghaus spaced repetition
     ];
     for (const col of knowledgeColumns) {
       await this.pool.query(
@@ -280,7 +364,15 @@ export class PostgresPort implements DatabasePort {
         params.skillId ?? null,
       ]
     );
-    return Number(result.rows[0].id);
+    const entryId = Number(result.rows[0].id);
+
+    // Auto-tag for topic timeline (fire-and-forget)
+    this.autoTagContent(
+      `${params.content} ${params.summary ?? ""} ${params.tags ?? ""}`,
+      "entry", entryId, params.agentId
+    ).catch(() => {});
+
+    return entryId;
   }
 
   async queryEntries(options: QueryEntriesOptions): Promise<any[]> {
@@ -664,7 +756,15 @@ export class PostgresPort implements DatabasePort {
         params.scope ?? "global",
       ]
     );
-    return Number(result.rows[0].id);
+    const factId = Number(result.rows[0].id);
+
+    // Auto-tag for topic timeline (fire-and-forget)
+    this.autoTagContent(
+      `${params.topic} ${params.fact}`,
+      "fact", factId, params.agentId
+    ).catch(() => {});
+
+    return factId;
   }
 
   async queryFacts(options: QueryFactsOptions): Promise<any[]> {
@@ -698,6 +798,10 @@ export class PostgresPort implements DatabasePort {
       clauses.push(`confidence > $${idx++}`);
       params.push(options.minConfidence);
     }
+    if (options.tier != null) {
+      clauses.push(`COALESCE(tier, 'warm') = $${idx++}`);
+      params.push(options.tier);
+    }
 
     const limit = options.limit ?? 50;
     params.push(limit);
@@ -705,7 +809,10 @@ export class PostgresPort implements DatabasePort {
     const result = await this.pool.query(
       `SELECT id, topic, fact, confidence, source_type, temporal_type,
               source_session, source_summary, scope, status, hnsw_key,
-              access_count, last_accessed_at, created_at, updated_at, expired_at
+              access_count, last_accessed_at, created_at, updated_at, expired_at,
+              COALESCE(repeated_count, 0) AS repeated_count,
+              COALESCE(tier, 'warm') AS tier,
+              COALESCE(strength, 1.0) AS strength
        FROM openclaw.agent_knowledge
        WHERE ${clauses.join(" AND ")}
        ORDER BY confidence DESC, updated_at DESC
@@ -722,6 +829,8 @@ export class PostgresPort implements DatabasePort {
       confidence?: number;
       status?: string;
       expired?: boolean;
+      tier?: string;
+      strength?: number;
     }
   ): Promise<void> {
     const setClauses: string[] = ["updated_at = NOW()"];
@@ -753,6 +862,14 @@ export class PostgresPort implements DatabasePort {
     }
     if (updates.expired === true) {
       setClauses.push("expired_at = NOW()");
+    }
+    if (updates.tier != null) {
+      setClauses.push(`tier = $${idx++}`);
+      params.push(updates.tier);
+    }
+    if (updates.strength != null) {
+      setClauses.push(`strength = $${idx++}`);
+      params.push(updates.strength);
     }
 
     params.push(id);
@@ -858,10 +975,22 @@ export class PostgresPort implements DatabasePort {
     );
   }
 
+  async incrementFactRepeatedCount(factId: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE openclaw.agent_knowledge
+       SET repeated_count = COALESCE(repeated_count, 0) + 1, updated_at = NOW()
+       WHERE id = $1`,
+      [factId]
+    );
+  }
+
   async getFactsForDecay(): Promise<any[]> {
     const result = await this.pool.query(
       `SELECT k.id, k.confidence, k.last_accessed_at, k.created_at, k.ttl_days,
-              t.ttl_days AS topic_ttl_days
+              t.ttl_days AS topic_ttl_days,
+              COALESCE(k.access_count, 0) AS access_count,
+              COALESCE(k.tier, 'warm') AS tier,
+              COALESCE(k.strength, 1.0) AS strength
        FROM openclaw.agent_knowledge k
        LEFT JOIN openclaw.agent_memory_topics t ON k.topic = t.name
        WHERE k.status = 'active' AND k.confidence > 0.3`
@@ -1013,7 +1142,15 @@ export class PostgresPort implements DatabasePort {
        RETURNING id`,
       [this.companyId, this.defaultAgentId, skillName, keywordsJson, confidence]
     );
-    return Number(result.rows[0].id);
+    const patternId = Number(result.rows[0].id);
+
+    // Auto-tag for topic timeline (fire-and-forget)
+    this.autoTagContent(
+      `${skillName} ${keywordsJson}`,
+      "pattern", patternId
+    ).catch(() => {});
+
+    return patternId;
   }
 
   async updatePatternSuccess(id: number, newConf: number): Promise<void> {
@@ -1147,15 +1284,25 @@ export class PostgresPort implements DatabasePort {
         data.keyFacts,
       ]
     );
+    let convId: number;
     if (result.rows.length === 0) {
       // ON CONFLICT hit — look up existing
       const existing = await this.pool.query(
         `SELECT id FROM openclaw.agent_conversations WHERE thread_id = $1 AND company_id = $2`,
         [data.threadId, this.companyId]
       );
-      return Number(existing.rows[0]?.id ?? 0);
+      convId = Number(existing.rows[0]?.id ?? 0);
+    } else {
+      convId = Number(result.rows[0].id);
     }
-    return Number(result.rows[0].id);
+
+    // Auto-tag for topic timeline (fire-and-forget)
+    this.autoTagContent(
+      `${data.topic} ${data.summary}`,
+      "conversation", convId
+    ).catch(() => {});
+
+    return convId;
   }
 
   async updateConversation(
@@ -1382,6 +1529,148 @@ export class PostgresPort implements DatabasePort {
         [limit]
       );
       return result.rows;
+    } catch {
+      return [];
+    }
+  }
+
+  // ===========================================================================
+  // Topic Timeline
+  // ===========================================================================
+
+  async getTopicTimeline(slug: string, limit: number = 50): Promise<Array<{
+    event_type: string;
+    event_id: number | null;
+    event_summary: string;
+    agent_id: string | null;
+    created_at: string;
+  }>> {
+    try {
+      const result = await this.pool.query(
+        `SELECT event_type, event_id, event_summary, agent_id::text, created_at::text
+         FROM openclaw.topic_timeline
+         WHERE topic_slug = $1
+         ORDER BY created_at DESC
+         LIMIT $2`,
+        [slug, limit]
+      );
+      return result.rows;
+    } catch {
+      return [];
+    }
+  }
+
+  async getTopicTrends(limit: number = 20): Promise<Array<{
+    slug: string;
+    label: string;
+    event_count: number;
+    trend_score: number;
+    last_seen: string;
+    recent_events: number;
+  }>> {
+    try {
+      // Compute trend_score on-read: sum(1/age_days) for events in last 30 days
+      const result = await this.pool.query(
+        `SELECT
+           r.slug,
+           r.label,
+           r.event_count,
+           COALESCE(t.trend_score, 0) AS trend_score,
+           r.last_seen::text,
+           COALESCE(t.recent_events, 0)::int AS recent_events
+         FROM openclaw.topic_registry r
+         LEFT JOIN LATERAL (
+           SELECT
+             SUM(1.0 / GREATEST(EXTRACT(EPOCH FROM (NOW() - tl.created_at)) / 86400.0, 0.1)) AS trend_score,
+             COUNT(*) FILTER (WHERE tl.created_at > NOW() - INTERVAL '7 days') AS recent_events
+           FROM openclaw.topic_timeline tl
+           WHERE tl.topic_slug = r.slug
+             AND tl.created_at > NOW() - INTERVAL '30 days'
+         ) t ON true
+         WHERE r.event_count > 0
+         ORDER BY trend_score DESC NULLS LAST
+         LIMIT $1`,
+        [limit]
+      );
+      return result.rows.map((r: any) => ({
+        slug: r.slug,
+        label: r.label,
+        event_count: Number(r.event_count),
+        trend_score: Number(Number(r.trend_score).toFixed(2)),
+        last_seen: r.last_seen,
+        recent_events: Number(r.recent_events),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async registerTopic(slug: string, label: string, aliases: string[], description?: string): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO openclaw.topic_registry (slug, label, aliases, description)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (slug) DO UPDATE SET
+         label = EXCLUDED.label,
+         aliases = EXCLUDED.aliases,
+         description = COALESCE(EXCLUDED.description, openclaw.topic_registry.description)`,
+      [slug, label, aliases, description ?? null]
+    );
+  }
+
+  async recordTopicEvent(slug: string, eventType: string, eventId?: number, summary?: string, agentId?: string): Promise<void> {
+    try {
+      // Look up topic for label/aliases
+      const reg = await this.pool.query(
+        `SELECT label, aliases FROM openclaw.topic_registry WHERE slug = $1`,
+        [slug]
+      );
+      if (reg.rows.length === 0) return;
+      const { label, aliases } = reg.rows[0];
+
+      const resolvedAgent = agentId ? this.resolveAgentId(agentId) : null;
+
+      await this.pool.query(
+        `INSERT INTO openclaw.topic_timeline (topic_slug, topic_label, aliases, event_type, event_id, event_summary, agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::uuid)`,
+        [slug, label, aliases ?? [], eventType, eventId ?? null, summary ?? null, resolvedAgent]
+      );
+
+      await this.pool.query(
+        `UPDATE openclaw.topic_registry
+         SET last_seen = NOW(), event_count = event_count + 1
+         WHERE slug = $1`,
+        [slug]
+      );
+    } catch {
+      // non-critical
+    }
+  }
+
+  async autoTagContent(content: string, eventType: string, eventId?: number, agentId?: string): Promise<string[]> {
+    try {
+      const topics = await this.pool.query(
+        `SELECT slug, aliases FROM openclaw.topic_registry`
+      );
+      const matched: string[] = [];
+      const lowerContent = content.toLowerCase();
+
+      for (const t of topics.rows) {
+        const aliases: string[] = t.aliases ?? [];
+        for (const alias of aliases) {
+          if (lowerContent.includes(alias.toLowerCase())) {
+            matched.push(t.slug);
+            break;
+          }
+        }
+      }
+
+      // Record events for all matched topics
+      const summary = content.slice(0, 120);
+      for (const slug of matched) {
+        await this.recordTopicEvent(slug, eventType, eventId, summary, agentId);
+      }
+
+      return matched;
     } catch {
       return [];
     }
@@ -1640,6 +1929,242 @@ export class PostgresPort implements DatabasePort {
         count: Number(s.count),
       })),
     };
+  }
+
+  // ===========================================================================
+  // Entities (v2.0)
+  // ===========================================================================
+
+  async storeEntity(params: import("./port").StoreEntityParams): Promise<number> {
+    const result = await this.pool.query(
+      `INSERT INTO openclaw.agent_entities (name, entity_type, aliases, metadata)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [params.name, params.entityType, params.aliases ?? [], JSON.stringify(params.metadata ?? {})]
+    );
+    return Number(result.rows[0].id);
+  }
+
+  async getEntityByName(name: string): Promise<any | undefined> {
+    // Exact match first, then alias match, then fuzzy
+    const exact = await this.pool.query(
+      `SELECT * FROM openclaw.agent_entities WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+      [name]
+    );
+    if (exact.rows.length > 0) return exact.rows[0];
+
+    const alias = await this.pool.query(
+      `SELECT * FROM openclaw.agent_entities WHERE $1 = ANY(aliases) LIMIT 1`,
+      [name]
+    );
+    if (alias.rows.length > 0) return alias.rows[0];
+
+    // Fuzzy trigram match
+    const fuzzy = await this.pool.query(
+      `SELECT *, similarity(name, $1) AS sim FROM openclaw.agent_entities
+       WHERE name % $1
+       ORDER BY sim DESC LIMIT 1`,
+      [name]
+    );
+    return fuzzy.rows[0] ?? undefined;
+  }
+
+  async getEntityById(id: number): Promise<any | undefined> {
+    const result = await this.pool.query(
+      `SELECT * FROM openclaw.agent_entities WHERE id = $1`,
+      [id]
+    );
+    return result.rows[0] ?? undefined;
+  }
+
+  async searchEntities(query: string, limit: number = 10): Promise<any[]> {
+    try {
+      const result = await this.pool.query(
+        `SELECT *, similarity(name, $1) AS sim FROM openclaw.agent_entities
+         WHERE name % $1 OR $1 = ANY(aliases)
+         ORDER BY sim DESC
+         LIMIT $2`,
+        [query, limit]
+      );
+      return result.rows;
+    } catch {
+      return [];
+    }
+  }
+
+  async searchEntitiesByEmbedding(embedding: number[], topK: number = 5): Promise<any[]> {
+    try {
+      const vecStr = this.vectorToString(embedding);
+      const result = await this.pool.query(
+        `SELECT e.*, (ae.embedding <=> $1::vector) AS distance
+         FROM openclaw.agent_entities e
+         JOIN openclaw.agent_embeddings ae ON ae.entry_id = e.id
+         ORDER BY ae.embedding <=> $1::vector
+         LIMIT $2`,
+        [vecStr, topK]
+      );
+      return result.rows;
+    } catch {
+      return [];
+    }
+  }
+
+  async mergeEntities(targetId: number, sourceId: number): Promise<void> {
+    // Move all mentions from source to target
+    await this.pool.query(
+      `UPDATE openclaw.agent_entity_mentions SET entity_id = $1 WHERE entity_id = $2`,
+      [targetId, sourceId]
+    );
+    // Move relations
+    await this.pool.query(
+      `UPDATE openclaw.agent_entity_relations SET source_entity_id = $1 WHERE source_entity_id = $2`,
+      [targetId, sourceId]
+    );
+    await this.pool.query(
+      `UPDATE openclaw.agent_entity_relations SET target_entity_id = $1 WHERE target_entity_id = $2`,
+      [targetId, sourceId]
+    );
+    // Merge aliases
+    const source = await this.getEntityById(sourceId);
+    const target = await this.getEntityById(targetId);
+    if (source && target) {
+      const mergedAliases = [...new Set([...(target.aliases ?? []), source.name, ...(source.aliases ?? [])])];
+      await this.pool.query(
+        `UPDATE openclaw.agent_entities SET aliases = $1, updated_at = NOW() WHERE id = $2`,
+        [mergedAliases, targetId]
+      );
+    }
+    // Delete source entity
+    await this.pool.query(`DELETE FROM openclaw.agent_entities WHERE id = $1`, [sourceId]);
+  }
+
+  async storeEntityRelation(params: import("./port").StoreEntityRelationParams): Promise<number> {
+    // Avoid duplicate relations
+    const existing = await this.pool.query(
+      `SELECT id FROM openclaw.agent_entity_relations
+       WHERE source_entity_id = $1 AND target_entity_id = $2 AND relation_type = $3
+       LIMIT 1`,
+      [params.sourceEntityId, params.targetEntityId, params.relationType]
+    );
+    if (existing.rows.length > 0) {
+      // Update confidence
+      await this.pool.query(
+        `UPDATE openclaw.agent_entity_relations SET confidence = GREATEST(confidence, $1) WHERE id = $2`,
+        [params.confidence ?? 0.8, existing.rows[0].id]
+      );
+      return Number(existing.rows[0].id);
+    }
+
+    const result = await this.pool.query(
+      `INSERT INTO openclaw.agent_entity_relations (source_entity_id, target_entity_id, relation_type, confidence, metadata)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [params.sourceEntityId, params.targetEntityId, params.relationType, params.confidence ?? 0.8, JSON.stringify(params.metadata ?? {})]
+    );
+    return Number(result.rows[0].id);
+  }
+
+  async getEntityRelations(entityId: number): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT r.*,
+              se.name AS source_name, se.entity_type AS source_type,
+              te.name AS target_name, te.entity_type AS target_type
+       FROM openclaw.agent_entity_relations r
+       JOIN openclaw.agent_entities se ON se.id = r.source_entity_id
+       JOIN openclaw.agent_entities te ON te.id = r.target_entity_id
+       WHERE r.source_entity_id = $1 OR r.target_entity_id = $1
+       ORDER BY r.confidence DESC`,
+      [entityId]
+    );
+    return result.rows;
+  }
+
+  async storeEntityMention(entityId: number, entryId?: number, factId?: number, contextSnippet?: string): Promise<number> {
+    const result = await this.pool.query(
+      `INSERT INTO openclaw.agent_entity_mentions (entity_id, entry_id, fact_id, context_snippet)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [entityId, entryId ?? null, factId ?? null, contextSnippet ?? null]
+    );
+    return Number(result.rows[0].id);
+  }
+
+  async getEntityMentions(entityId: number, limit: number = 20): Promise<any[]> {
+    const result = await this.pool.query(
+      `SELECT * FROM openclaw.agent_entity_mentions
+       WHERE entity_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [entityId, limit]
+    );
+    return result.rows;
+  }
+
+  // ===========================================================================
+  // Memory Tiering (v2.0)
+  // ===========================================================================
+
+  async getHotFacts(scope?: string): Promise<any[]> {
+    const params: any[] = [];
+    let scopeClause = "";
+    if (scope) {
+      scopeClause = `AND (scope = 'global' OR scope = $1)`;
+      params.push(scope);
+    }
+    const result = await this.pool.query(
+      `SELECT id, topic, fact, confidence, scope, access_count, tier, strength
+       FROM openclaw.agent_knowledge
+       WHERE status = 'active' AND COALESCE(tier, 'warm') = 'hot'
+         ${scopeClause}
+       ORDER BY confidence DESC
+       LIMIT 20`,
+      params
+    );
+    return result.rows;
+  }
+
+  async updateFactTier(factId: number, tier: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE openclaw.agent_knowledge SET tier = $1, updated_at = NOW() WHERE id = $2`,
+      [tier, factId]
+    );
+  }
+
+  async updateFactStrength(factId: number, strength: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE openclaw.agent_knowledge SET strength = $1, updated_at = NOW() WHERE id = $2`,
+      [strength, factId]
+    );
+  }
+
+  // ===========================================================================
+  // Skill Embedding Cache (v2.0 — P7)
+  // ===========================================================================
+
+  async getSkillEmbedding(skillName: string): Promise<number[] | null> {
+    try {
+      const result = await this.pool.query(
+        `SELECT embedding::text FROM openclaw.agent_skill_embeddings WHERE skill_name = $1`,
+        [skillName]
+      );
+      if (result.rows.length === 0) return null;
+      const raw = result.rows[0].embedding;
+      // Parse "[1,2,3,...]" format
+      const arr = JSON.parse(raw.replace(/^\[/, "[").replace(/\]$/, "]"));
+      return Array.isArray(arr) ? arr : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async storeSkillEmbedding(skillName: string, embedding: number[]): Promise<void> {
+    const vecStr = this.vectorToString(embedding);
+    await this.pool.query(
+      `INSERT INTO openclaw.agent_skill_embeddings (skill_name, embedding, embedded_at)
+       VALUES ($1, $2::vector, NOW())
+       ON CONFLICT (skill_name) DO UPDATE SET embedding = $2::vector, embedded_at = NOW()`,
+      [skillName, vecStr]
+    );
   }
 
   // ===========================================================================

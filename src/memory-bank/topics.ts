@@ -50,4 +50,10 @@ export const DEFAULT_TOPICS: Array<{
     ttl_days: 90,
     priority: 5,
   },
+  {
+    name: "lessons_learned",
+    description: "Critical mistakes, failures, and rules learned from errors — injected as guardrails before actions",
+    ttl_days: null,
+    priority: 10,
+  },
 ];

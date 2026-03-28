@@ -12,7 +12,7 @@ const EXTRACTION_PROMPT = `You are a memory extraction system. Analyze the conve
 
 For each fact, output a JSON array of objects with these fields:
 - "fact": A concise, standalone statement (one sentence)
-- "topic": One of: user_preferences, technical_facts, project_context, instructions, people_orgs, decisions, learned_patterns
+- "topic": One of: user_preferences, technical_facts, project_context, instructions, people_orgs, decisions, learned_patterns, lessons_learned
 - "confidence": 0.0-1.0 how confident you are this is a real, stable fact
 - "temporal_type": One of: "current_state", "historical", "permanent"
 

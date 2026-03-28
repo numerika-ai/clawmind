@@ -1,7 +1,7 @@
 {
   "name": "memory-unified",
-  "version": "1.0.0",
-  "description": "Unified memory plugin: USMD SQLite skill memory + sqlite-vec vector search",
+  "version": "2.0.0",
+  "description": "Unified memory plugin: entity resolution, multi-strategy RAG, memory tiering, Ebbinghaus decay",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "openclaw": {

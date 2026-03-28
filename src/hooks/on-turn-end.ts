@@ -15,6 +15,7 @@ import {
 } from "../utils/helpers";
 import { extractFacts } from "../memory-bank/extractor";
 import { consolidateFact } from "../memory-bank/consolidator";
+import { extractAndLinkEntities } from "../entity/extractor";
 
 // State variables shared across hooks
 interface MemoryState {
@@ -43,11 +44,16 @@ interface HookDependencies {
  * These tools carry decision/routing/config information that improves RAG quality.
  */
 const TOOL_LOG_WHITELIST = new Set([
-  "sessions_spawn",   // MoE routing decisions
-  "message",          // communication decisions
-  "gateway",          // config changes
-  "cron",             // scheduled task changes
-  "unified_store",    // explicit memory stores
+  "sessions_spawn",      // MoE routing decisions
+  "message",             // communication decisions
+  "gateway",             // config changes
+  "cron",                // scheduled task changes
+  "unified_store",       // explicit memory stores
+  "unified_search",      // search queries reveal intent
+  "memory_bank_manage",  // memory management decisions
+  "web_search",          // external search queries
+  "web_fetch",           // external data fetches
+  "unified_reflect",     // synthesis queries (v2.0)
 ]);
 
 /**
@@ -234,7 +240,8 @@ export function createAgentEndHook(deps: HookDependencies) {
           for (const conv of recentConversations) {
             const existingTags: string[] = JSON.parse(conv.tags || '[]');
             const overlap = convTags.filter((t: string) => existingTags.includes(t)).length;
-            if (overlap >= 1 || conv.topic.toLowerCase().includes(topic.toLowerCase().slice(0, 20))) {
+            // P6 fix: require overlap >= 2 to avoid over-merging conversations
+            if (overlap >= 2 || conv.topic.toLowerCase().includes(topic.toLowerCase().slice(0, 20))) {
               conversationId = conv.id as number;
               isNewConversation = false;
 
@@ -320,6 +327,12 @@ export function createAgentEndHook(deps: HookDependencies) {
                 if (facts.length > 0) {
                   api.logger.info?.(`memory-bank: extracted ${facts.length} facts from conversation`);
                 }
+                // Entity extraction (v2.0 — fire and forget)
+                try {
+                  await extractAndLinkEntities(conversationText, port, memoryBankConfig, api.logger);
+                } catch (entErr) {
+                  api.logger.warn?.("memory-bank: entity extraction error:", String(entErr).slice(0, 100));
+                }
               })
               .catch((exErr) => {
                 api.logger.warn?.("memory-bank: extraction error:", String(exErr).slice(0, 100));
@@ -343,4 +356,143 @@ export function createAgentEndHook(deps: HookDependencies) {
       (globalThis as any).__openclawSessionKey = undefined;
     }
   };
+}
+
+/**
+ * Creates the before_compaction hook.
+ * Extracts lessons learned and critical mistakes from the conversation
+ * being compacted so they're not lost when context is trimmed.
+ */
+export function createCompactionHook(deps: HookDependencies) {
+  const { port, memoryState, memoryBankConfig } = deps;
+
+  return async function(api: PluginApi, event: Record<string, unknown>) {
+    if (!memoryBankConfig?.enabled) return;
+
+    try {
+      const messages = event.messages as Array<{ role: string; content: string }> | undefined;
+      if (!messages || messages.length < 2) return;
+
+      // Build conversation text from messages being compacted
+      const conversationText = messages
+        .map(m => `${m.role}: ${typeof m.content === "string" ? m.content.slice(0, 1000) : ""}`)
+        .join("\n")
+        .slice(0, 8000);
+
+      if (conversationText.length < 100) return;
+
+      // Use a specialized extraction prompt focused on lessons and mistakes
+      const lessonConfig: MemoryBankConfig = {
+        ...memoryBankConfig,
+        maxFactsPerTurn: 5,
+      };
+
+      const facts = await extractLessonsFromCompaction(conversationText, lessonConfig);
+      const factScope = memoryState.agentId ?? "global";
+
+      let stored = 0;
+      for (const fact of facts) {
+        try {
+          await consolidateFact(fact, port, memoryBankConfig, null, api.logger, factScope);
+          stored++;
+        } catch (consErr) {
+          api.logger.warn?.("memory-bank: compaction consolidation error:", String(consErr).slice(0, 100));
+        }
+      }
+
+      if (stored > 0) {
+        api.logger.info?.(`memory-bank: extracted ${stored} lessons from compaction (${messages.length} messages)`);
+      }
+    } catch (compErr) {
+      api.logger.warn?.("memory-bank: compaction extraction error:", String(compErr).slice(0, 100));
+    }
+  };
+}
+
+/**
+ * Extract lessons/mistakes/rules from a conversation being compacted.
+ * Uses a specialized prompt focused on errors, corrections, and "don't do X" patterns.
+ */
+async function extractLessonsFromCompaction(
+  conversationText: string,
+  config: MemoryBankConfig,
+): Promise<import("../memory-bank/types").ExtractedFact[]> {
+  const LESSON_PROMPT = `You are a lesson extraction system. Analyze this conversation and extract ONLY lessons learned, mistakes made, corrections given, and rules established. Focus on:
+- Errors the assistant made and what the correct approach should be
+- "Don't do X" / "Never do Y" rules
+- Corrections from the user about wrong approaches
+- Important guardrails or constraints discovered during the conversation
+
+For each lesson, output a JSON array with:
+- "fact": A clear, imperative statement (e.g., "Never restart the gateway directly — use the Wiki restart procedure")
+- "topic": "lessons_learned"
+- "confidence": 0.9 (high — these are explicitly stated corrections)
+- "temporal_type": "permanent"
+
+Rules:
+- ONLY extract mistakes, corrections, and rules — skip normal conversation
+- If no lessons/mistakes found, output an empty array []
+- Output ONLY a JSON array
+
+Conversation:
+`;
+
+  try {
+    const isAnthropic = config.extractionUrl.includes("anthropic.com");
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (config.extractionApiKey) {
+      if (isAnthropic) {
+        headers["x-api-key"] = config.extractionApiKey;
+        headers["anthropic-version"] = "2023-06-01";
+      } else {
+        headers["Authorization"] = `Bearer ${config.extractionApiKey}`;
+      }
+    }
+
+    const resp = await fetch(config.extractionUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: config.extractionModel,
+        messages: [{ role: "user", content: LESSON_PROMPT + conversationText.slice(0, 6000) }],
+        temperature: 0.2,
+        max_tokens: 1500,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!resp.ok) return [];
+
+    const data = (await resp.json()) as any;
+    const content = isAnthropic
+      ? (data?.content?.[0]?.text ?? "")
+      : (data?.choices?.[0]?.message?.content ?? "");
+
+    const jsonMatch = content.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return [];
+
+    const parsed = JSON.parse(jsonMatch[0]) as unknown[];
+    if (!Array.isArray(parsed)) return [];
+
+    const facts: import("../memory-bank/types").ExtractedFact[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const obj = item as Record<string, unknown>;
+      const fact = typeof obj.fact === "string" ? obj.fact.trim() : "";
+      if (!fact || fact.length < 10) continue;
+
+      facts.push({
+        fact,
+        topic: "lessons_learned",
+        confidence: typeof obj.confidence === "number" ? Math.min(1, Math.max(0.5, obj.confidence)) : 0.9,
+        temporal_type: "permanent",
+      });
+
+      if (facts.length >= config.maxFactsPerTurn) break;
+    }
+
+    return facts;
+  } catch {
+    return [];
+  }
 }

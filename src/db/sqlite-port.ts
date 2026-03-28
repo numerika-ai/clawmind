@@ -9,6 +9,8 @@ import type {
   DatabasePort,
   StoreEntryParams,
   StoreFactParams,
+  StoreEntityParams,
+  StoreEntityRelationParams,
   QueryEntriesOptions,
   QueryFactsOptions,
   QueryPatternsOptions,
@@ -271,7 +273,7 @@ export class SqlitePort implements DatabasePort {
 
   async updateFact(
     id: number,
-    updates: { fact?: string; confidence?: number; status?: string; expired?: boolean }
+    updates: { fact?: string; confidence?: number; status?: string; expired?: boolean; tier?: string; strength?: number }
   ): Promise<void> {
     const setClauses: string[] = ["updated_at = CURRENT_TIMESTAMP"];
     const params: any[] = [];
@@ -290,6 +292,14 @@ export class SqlitePort implements DatabasePort {
     }
     if (updates.expired === true) {
       setClauses.push("expired_at = CURRENT_TIMESTAMP");
+    }
+    if (updates.tier != null) {
+      setClauses.push("tier = ?");
+      params.push(updates.tier);
+    }
+    if (updates.strength != null) {
+      setClauses.push("strength = ?");
+      params.push(updates.strength);
     }
 
     params.push(id);
@@ -346,10 +356,20 @@ export class SqlitePort implements DatabasePort {
       .run(factId);
   }
 
+  async incrementFactRepeatedCount(factId: number): Promise<void> {
+    this.udb.db
+      .prepare(
+        "UPDATE memory_facts SET repeated_count = COALESCE(repeated_count, 0) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+      )
+      .run(factId);
+  }
+
   async getFactsForDecay(): Promise<any[]> {
     return this.udb.db
       .prepare(
-        `SELECT f.id, f.confidence, f.last_accessed_at, f.created_at, f.ttl_days, t.ttl_days AS topic_ttl_days
+        `SELECT f.id, f.confidence, f.last_accessed_at, f.created_at, f.ttl_days,
+                f.access_count, f.tier, f.strength,
+                t.ttl_days AS topic_ttl_days
          FROM memory_facts f
          LEFT JOIN memory_topics t ON f.topic = t.name
          WHERE f.status = 'active' AND f.confidence > 0.3`
@@ -807,6 +827,45 @@ export class SqlitePort implements DatabasePort {
   // Search Aliases (no-op for SQLite — Postgres-only feature)
   // =========================================================================
 
+  // =========================================================================
+  // Topic Timeline (Postgres-only — stubs for SQLite)
+  // =========================================================================
+
+  async getTopicTimeline(_slug: string, _limit?: number): Promise<Array<{
+    event_type: string;
+    event_id: number | null;
+    event_summary: string;
+    agent_id: string | null;
+    created_at: string;
+  }>> {
+    return [];
+  }
+
+  async getTopicTrends(_limit?: number): Promise<Array<{
+    slug: string;
+    label: string;
+    event_count: number;
+    trend_score: number;
+    last_seen: string;
+    recent_events: number;
+  }>> {
+    return [];
+  }
+
+  async registerTopic(_slug: string, _label: string, _aliases: string[], _description?: string): Promise<void> {
+    // no-op
+  }
+
+  async recordTopicEvent(_slug: string, _eventType: string, _eventId?: number, _summary?: string, _agentId?: string): Promise<void> {
+    // no-op
+  }
+
+  async autoTagContent(_content: string, _eventType: string, _eventId?: number, _agentId?: string): Promise<string[]> {
+    return [];
+  }
+
+  // =========================================================================
+
   async expandQuery(query: string): Promise<string> {
     return query;
   }
@@ -958,6 +1017,98 @@ export class SqlitePort implements DatabasePort {
     }
 
     return stats;
+  }
+
+  // =========================================================================
+  // Entities (Postgres-only — stubs for SQLite)
+  // =========================================================================
+
+  async storeEntity(_params: StoreEntityParams): Promise<number> {
+    return 0;
+  }
+
+  async getEntityByName(_name: string): Promise<any | undefined> {
+    return undefined;
+  }
+
+  async getEntityById(_id: number): Promise<any | undefined> {
+    return undefined;
+  }
+
+  async searchEntities(_query: string, _limit?: number): Promise<any[]> {
+    return [];
+  }
+
+  async searchEntitiesByEmbedding(_embedding: number[], _topK?: number): Promise<any[]> {
+    return [];
+  }
+
+  async mergeEntities(_targetId: number, _sourceId: number): Promise<void> {
+    // no-op
+  }
+
+  async storeEntityRelation(_params: StoreEntityRelationParams): Promise<number> {
+    return 0;
+  }
+
+  async getEntityRelations(_entityId: number): Promise<any[]> {
+    return [];
+  }
+
+  async storeEntityMention(_entityId: number, _entryId?: number, _factId?: number, _contextSnippet?: string): Promise<number> {
+    return 0;
+  }
+
+  async getEntityMentions(_entityId: number, _limit?: number): Promise<any[]> {
+    return [];
+  }
+
+  // =========================================================================
+  // Memory Tiering (SQLite stubs — tier/strength columns may not exist)
+  // =========================================================================
+
+  async getHotFacts(_scope?: string): Promise<any[]> {
+    try {
+      return this.udb.db
+        .prepare(
+          "SELECT * FROM memory_facts WHERE status = 'active' AND tier = 'hot' ORDER BY confidence DESC LIMIT 20"
+        )
+        .all();
+    } catch {
+      return [];
+    }
+  }
+
+  async updateFactTier(factId: number, tier: string): Promise<void> {
+    try {
+      this.udb.db
+        .prepare("UPDATE memory_facts SET tier = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .run(tier, factId);
+    } catch {
+      // tier column may not exist in SQLite
+    }
+  }
+
+  async updateFactStrength(factId: number, strength: number): Promise<void> {
+    try {
+      this.udb.db
+        .prepare("UPDATE memory_facts SET strength = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .run(strength, factId);
+    } catch {
+      // strength column may not exist in SQLite
+    }
+  }
+
+  // =========================================================================
+  // Skill Embedding Cache (SQLite stubs)
+  // =========================================================================
+
+  async getSkillEmbedding(_skillName: string): Promise<number[] | null> {
+    return null;
+  }
+
+  async storeSkillEmbedding(_skillName: string, _embedding: number[]): Promise<void> {
+    // no-op
   }
 
   // =========================================================================

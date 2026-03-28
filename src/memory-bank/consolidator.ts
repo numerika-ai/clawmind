@@ -117,6 +117,18 @@ export async function consolidateFact(
   }
 
   // Consolidation logic
+
+  // Error repetition detection: for lessons_learned, a lower threshold (0.85) triggers
+  // confidence boost to 1.0 and increments repeated_count
+  if (bestMatch && bestSim > 0.85 && newFact.topic === "lessons_learned") {
+    await port.updateFact(bestMatch.id, { confidence: 1.0 });
+    await port.incrementFactRepeatedCount(bestMatch.id);
+    await logRevision(port, bestMatch.id, "merged", bestMatch.fact, newFact.fact,
+      `REPEATED lesson detected (sim=${bestSim.toFixed(3)}): confidence forced to 1.0, repeated_count incremented`);
+    logger.info?.(`memory-bank: ⚠️ REPEATED LESSON fact #${bestMatch.id} (sim=${bestSim.toFixed(3)}) — boosted to max confidence`);
+    return { action: "boosted", factId: bestMatch.id, similarity: bestSim };
+  }
+
   if (bestMatch && bestSim > 0.95) {
     // Near-duplicate: boost confidence
     const newConf = Math.min(1.0, bestMatch.confidence + 0.05);

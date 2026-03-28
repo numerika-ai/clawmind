@@ -9,6 +9,21 @@ import type { EntryType } from "../config";
 
 // === Parameter types ===
 
+export interface StoreEntityParams {
+  name: string;
+  entityType: string; // person, org, project, tool, concept
+  aliases?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface StoreEntityRelationParams {
+  sourceEntityId: number;
+  targetEntityId: number;
+  relationType: string;
+  confidence?: number;
+  metadata?: Record<string, unknown>;
+}
+
 export interface StoreEntryParams {
   entryType: EntryType;
   tags?: string;
@@ -47,6 +62,7 @@ export interface QueryFactsOptions {
   scope?: string;
   textSearch?: string;
   minConfidence?: number;
+  tier?: string; // hot, warm, cold
   limit?: number;
 }
 
@@ -149,10 +165,11 @@ export interface DatabasePort {
   getTopics(): Promise<any[]>;
   storeFact(params: StoreFactParams): Promise<number>;
   queryFacts(options: QueryFactsOptions): Promise<any[]>;
-  updateFact(id: number, updates: { fact?: string; confidence?: number; status?: string; expired?: boolean }): Promise<void>;
+  updateFact(id: number, updates: { fact?: string; confidence?: number; status?: string; expired?: boolean; tier?: string; strength?: number }): Promise<void>;
   expireFactsByTTL(): Promise<number>;
   getFactStats(): Promise<FactStats>;
   updateFactAccessCount(factId: number): Promise<void>;
+  incrementFactRepeatedCount(factId: number): Promise<void>;
   getFactsForDecay(): Promise<any[]>;
 
   // === Fact Vectors ===
@@ -193,9 +210,50 @@ export interface DatabasePort {
   getFeedback(opts?: { agentId?: string; rating?: number; limit?: number; skillName?: string }): Promise<Array<{ id: number; agent_id: string; task_description: string; rating: number; comment: string | null; skill_name: string | null; created_at: string }>>;
   getFeedbackStats(agentId?: string): Promise<{ total: number; positive: number; negative: number; neutral: number; topSkills: Array<{ skill: string; avgRating: number; count: number }> }>;
 
+  // === Topic Timeline ===
+  getTopicTimeline(slug: string, limit?: number): Promise<Array<{
+    event_type: string;
+    event_id: number | null;
+    event_summary: string;
+    agent_id: string | null;
+    created_at: string;
+  }>>;
+  getTopicTrends(limit?: number): Promise<Array<{
+    slug: string;
+    label: string;
+    event_count: number;
+    trend_score: number;
+    last_seen: string;
+    recent_events: number;
+  }>>;
+  registerTopic(slug: string, label: string, aliases: string[], description?: string): Promise<void>;
+  recordTopicEvent(slug: string, eventType: string, eventId?: number, summary?: string, agentId?: string): Promise<void>;
+  autoTagContent(content: string, eventType: string, eventId?: number, agentId?: string): Promise<string[]>;
+
   // === Search Aliases ===
   expandQuery(query: string): Promise<string>;
   addAlias(alias: string, canonical: string, relatedTerms?: string[]): Promise<void>;
+
+  // === Entities ===
+  storeEntity(params: StoreEntityParams): Promise<number>;
+  getEntityByName(name: string): Promise<any | undefined>;
+  getEntityById(id: number): Promise<any | undefined>;
+  searchEntities(query: string, limit?: number): Promise<any[]>;
+  searchEntitiesByEmbedding(embedding: number[], topK?: number): Promise<any[]>;
+  mergeEntities(targetId: number, sourceId: number): Promise<void>;
+  storeEntityRelation(params: StoreEntityRelationParams): Promise<number>;
+  getEntityRelations(entityId: number): Promise<any[]>;
+  storeEntityMention(entityId: number, entryId?: number, factId?: number, contextSnippet?: string): Promise<number>;
+  getEntityMentions(entityId: number, limit?: number): Promise<any[]>;
+
+  // === Memory Tiering ===
+  getHotFacts(scope?: string): Promise<any[]>;
+  updateFactTier(factId: number, tier: string): Promise<void>;
+  updateFactStrength(factId: number, strength: number): Promise<void>;
+
+  // === Skill Embedding Cache ===
+  getSkillEmbedding(skillName: string): Promise<number[] | null>;
+  storeSkillEmbedding(skillName: string, embedding: number[]): Promise<void>;
 
   // === Maintenance ===
   runDataCleanup(): Promise<CleanupResult>;

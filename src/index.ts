@@ -32,7 +32,7 @@ import type { MemoryBankConfig } from "./memory-bank/types";
 
 // Hooks
 import { createRagInjectionHook } from "./hooks/rag-injection";
-import { createToolCallLogHook, createAgentEndHook } from "./hooks/on-turn-end";
+import { createToolCallLogHook, createAgentEndHook, createCompactionHook } from "./hooks/on-turn-end";
 
 // Tools
 import { createUnifiedSearchTool } from "./tools/unified-search";
@@ -41,6 +41,8 @@ import { createUnifiedConversationsTool } from "./tools/unified-conversations";
 import { createUnifiedIndexFilesTool } from "./tools/file-indexer";
 import { createMemoryBankManageTool } from "./tools/memory-bank-manage";
 import { createFeedbackTool } from "./tools/feedback";
+import { createTopicTimelineTool } from "./tools/topic-timeline";
+import { createUnifiedReflectTool } from "./tools/unified-reflect";
 
 // Utils
 import { chunkText, autoTag, summarize, extractKeywords } from "./utils/helpers";
@@ -202,6 +204,32 @@ const memoryUnifiedPlugin = {
             } catch (e) { api.logger.warn?.("memory-unified: topic seed failed:", String(e)); }
           }
 
+          // Seed topic registry for timeline tracking
+          try {
+            const seedTopics: Array<{ slug: string; label: string; aliases: string[]; description?: string }> = [
+              { slug: "postgres", label: "Postgres Migration", aliases: ["pgvector", "PG", "openclaw-postgres", "pg_restore", "migracja"] },
+              { slug: "memory-unified", label: "Memory Unified Plugin", aliases: ["memory_bank", "memoryunif", "search alias", "recency boost", "embedding"] },
+              { slug: "pai-vertex", label: "PAI / Vertex", aliases: ["PAI", "Vertex", "Personal AI", "TELOS", "Google Vertex"] },
+              { slug: "higienistka", label: "Higienistka App", aliases: ["higienist", "ankiet", "generator plan", "blocks.json"] },
+              { slug: "numerika-ig", label: "Numerika Instagram", aliases: ["Instagram", "social media", "filary", "bio", "karuzela", "hook neuro"] },
+              { slug: "cloudflare", label: "Cloudflare Tunnels", aliases: ["Cloudflare", "tunnel", "cloudflared", "trycloudflare"] },
+              { slug: "mission-control", label: "Mission Control", aliases: ["Mission Control", "MC setup", ":3030"] },
+              { slug: "multi-agent", label: "Multi-Agent System", aliases: ["multi-agent", "agents.list", "binding"] },
+              { slug: "nemotron-spark", label: "Nemotron / Spark", aliases: ["Nemotron", "DGX", "Spark", "tok/s", "driver 590", "sm_121"] },
+              { slug: "collector", label: "Collector Service", aliases: ["collector", "Mac Mini", "health endpoint", "DuckDB"] },
+              { slug: "hermes", label: "Hermes Project", aliases: ["Hermes", "hotel", "Silkstone", "w.sterling"] },
+              { slug: "claude-code", label: "Claude Code", aliases: ["Claude Code", "ACP", "sessions_spawn"] },
+              { slug: "plane-pm", label: "Plane PM", aliases: ["Plane", "work item", "numerika-hq", "Agentic Platform"] },
+              { slug: "discord-routing", label: "Discord Routing", aliases: ["dmScope", "per-peer", "session routing"] },
+              { slug: "training-crypto", label: "Training / Crypto Bot", aliases: ["training", "crypto bot", "grid", "SurvivalGrid", "live trader"] },
+              { slug: "dominika", label: "Dominika", aliases: ["Dominika", "domi.zro"] },
+            ];
+            for (const t of seedTopics) {
+              await port.registerTopic(t.slug, t.label, t.aliases, t.description);
+            }
+            api.logger.info?.(`memory-unified: seeded ${seedTopics.length} topics in topic_registry`);
+          } catch (e) { api.logger.warn?.("memory-unified: topic registry seed failed:", String(e)); }
+
           // Archive phantom conversations
           try {
             const archived = await port.archiveConversations({ phantom: true });
@@ -215,6 +243,17 @@ const memoryUnifiedPlugin = {
               api.logger.info?.(`memory-unified: cleanup — tools=${stats.toolEntriesDeleted}, convs=${stats.conversationsArchived}`);
             }
           } catch (e) { api.logger.warn?.("memory-unified: cleanup failed:", String(e)); }
+
+          // v2.0: Async maintenance (Ebbinghaus decay + tiering + pattern GC)
+          if (memoryBankConfig?.enabled) {
+            try {
+              const { runMaintenanceAsync } = await import("./memory-bank/maintenance");
+              const mResult = await runMaintenanceAsync(port, api.logger);
+              if (mResult.expired > 0 || mResult.decayed > 0 || mResult.tierChanges > 0) {
+                api.logger.info?.(`memory-unified: startup maintenance — expired=${mResult.expired}, decayed=${mResult.decayed}, tierChanges=${mResult.tierChanges}`);
+              }
+            } catch (e) { api.logger.warn?.("memory-unified: async maintenance failed:", String(e)); }
+          }
         })
         .catch(err => api.logger.error?.("memory-unified: Postgres init failed:", String(err)));
     } else {
@@ -335,6 +374,23 @@ const memoryUnifiedPlugin = {
     }
 
     // ========================================================================
+    // Hook 4: before_compaction → extract lessons before context loss
+    // ========================================================================
+    if (memoryBankConfig?.enabled) {
+      const compactionHook = createCompactionHook({
+        port,
+        lanceManager: vectorManager,
+        cfg,
+        memoryState,
+        memoryBankConfig,
+      });
+
+      api.on("before_compaction", async (event) => {
+        return await compactionHook(api, event);
+      });
+    }
+
+    // ========================================================================
     // Tools: Register all tools
     // ========================================================================
     api.registerTool(createUnifiedSearchTool(port, vectorManager), { name: "unified_search" });
@@ -343,6 +399,8 @@ const memoryUnifiedPlugin = {
     api.registerTool(createUnifiedIndexFilesTool(port), { name: "unified_index_files" });
     api.registerTool(createMemoryBankManageTool(port), { name: "memory_bank_manage" });
     api.registerTool(createFeedbackTool(port), { name: "feedback" });
+    api.registerTool(createTopicTimelineTool(port), { name: "topic_timeline" });
+    api.registerTool(createUnifiedReflectTool(port, vectorManager), { name: "unified_reflect" });
 
     // ========================================================================
     // CLI: openclaw ingest <path>

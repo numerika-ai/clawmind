@@ -276,6 +276,7 @@ CREATE INDEX IF NOT EXISTS idx_unified_agent ON unified_entries(agent_id);
     addColumnSafe("memory_facts", "status", "TEXT DEFAULT 'active'");
     addColumnSafe("memory_facts", "scope", "TEXT DEFAULT 'global'");
     addColumnSafe("memory_facts", "temporal_type", "TEXT DEFAULT 'current_state'");
+    addColumnSafe("memory_facts", "repeated_count", "INTEGER DEFAULT 0");
 
     // Expand revision_type constraint for existing DBs (SQLite can't ALTER CHECK constraints,
     // but new values will work since CHECK is only enforced on the original DDL if table already existed

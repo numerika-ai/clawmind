@@ -2108,6 +2108,24 @@ export class PostgresPort implements DatabasePort {
   }
 
   // ===========================================================================
+  // Learning Observations
+  // ===========================================================================
+
+  async queryLearnings(options: { status?: string[]; limit?: number } = {}): Promise<any[]> {
+    const statuses = options.status ?? ['proposed', 'accepted'];
+    const limit = options.limit ?? 10;
+    const result = await this.pool.query(
+      `SELECT learning_type, title, description, status, created_at
+       FROM openclaw.agent_learning
+       WHERE status = ANY($1::text[])
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [statuses, limit],
+    );
+    return result.rows;
+  }
+
+  // ===========================================================================
   // Entity Backfill Helpers (Phase C2)
   // ===========================================================================
 

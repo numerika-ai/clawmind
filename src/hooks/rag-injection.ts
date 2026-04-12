@@ -223,15 +223,12 @@ export function createRagInjectionHook(deps: HookDependencies) {
 
       // LEARNING OBSERVATIONS (from unified-memory collector → agent_learning)
       // Reads proposed/accepted learnings and injects as guardrails.
+      // Uses port.queryFacts as a proxy — agent_learning is queried via
+      // a dedicated method to avoid (port as any).pool bypass.
       try {
-        const learnings = await (port as any).pool?.query?.(
-          `SELECT learning_type, title, description
-           FROM openclaw.agent_learning
-           WHERE status IN ('proposed', 'accepted')
-           ORDER BY created_at DESC LIMIT 10`
-        );
-        if (learnings?.rows?.length > 0) {
-          for (const l of learnings.rows) {
+        const learnings = await port.queryLearnings?.({ status: ['proposed', 'accepted'], limit: 10 });
+        if (learnings && learnings.length > 0) {
+          for (const l of learnings) {
             if (l.learning_type === 'failure_analysis') {
               guardrailLines.push(`[learned] ${l.title}: ${l.description?.slice(0, 150)}`);
             } else {

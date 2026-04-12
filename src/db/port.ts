@@ -247,6 +247,9 @@ export interface DatabasePort {
   storeEntityMention(entityId: number, entryId?: number, factId?: number, contextSnippet?: string): Promise<number>;
   getEntityMentions(entityId: number, limit?: number): Promise<any[]>;
 
+  // === Learning Observations ===
+  queryLearnings?(options: { status?: string[]; limit?: number }): Promise<any[]>;
+
   // === Entity Backfill Helpers ===
   getFactIdsWithEntityMentions(): Promise<Set<number>>;
   getEntryIdsWithEntityMentions(): Promise<Set<number>>;

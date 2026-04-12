@@ -160,66 +160,29 @@ export async function backfillEntitiesFromEntries(
 }
 
 // ============================================================================
-// Helpers
+// Helpers — delegates to DatabasePort methods (no direct pool access)
 // ============================================================================
 
 async function getFactIdsWithMentions(port: DatabasePort): Promise<Set<number>> {
-  try {
-    const rows = await (port as any).pool.query(
-      `SELECT DISTINCT fact_id FROM openclaw.agent_entity_mentions WHERE fact_id IS NOT NULL`
-    );
-    return new Set(rows.rows.map((r: any) => r.fact_id));
-  } catch {
-    return new Set();
-  }
+  return port.getFactIdsWithEntityMentions();
 }
 
 async function getEntryIdsWithMentions(port: DatabasePort): Promise<Set<number>> {
-  try {
-    const rows = await (port as any).pool.query(
-      `SELECT DISTINCT entry_id FROM openclaw.agent_entity_mentions WHERE entry_id IS NOT NULL`
-    );
-    return new Set(rows.rows.map((r: any) => r.entry_id));
-  } catch {
-    return new Set();
-  }
+  return port.getEntryIdsWithEntityMentions();
 }
 
 async function countEntities(port: DatabasePort): Promise<number> {
-  try {
-    const r = await (port as any).pool.query(`SELECT COUNT(*)::int as c FROM openclaw.agent_entities`);
-    return r.rows[0]?.c || 0;
-  } catch { return 0; }
+  return port.countEntities();
 }
 
 async function countRelations(port: DatabasePort): Promise<number> {
-  try {
-    const r = await (port as any).pool.query(`SELECT COUNT(*)::int as c FROM openclaw.agent_entity_relations`);
-    return r.rows[0]?.c || 0;
-  } catch { return 0; }
+  return port.countRelations();
 }
 
 async function linkExtractedToFact(port: DatabasePort, factId: number, _text: string): Promise<void> {
-  // Update recent mentions (last 30s) that lack a fact_id to link them to this fact
-  try {
-    await (port as any).pool.query(
-      `UPDATE openclaw.agent_entity_mentions
-       SET fact_id = $1
-       WHERE fact_id IS NULL AND entry_id IS NULL
-         AND created_at > NOW() - INTERVAL '30 seconds'`,
-      [factId]
-    );
-  } catch {}
+  await port.linkRecentMentionsToFact(factId, 30);
 }
 
 async function linkExtractedToEntry(port: DatabasePort, entryId: number, _text: string): Promise<void> {
-  try {
-    await (port as any).pool.query(
-      `UPDATE openclaw.agent_entity_mentions
-       SET entry_id = $1
-       WHERE fact_id IS NULL AND entry_id IS NULL
-         AND created_at > NOW() - INTERVAL '30 seconds'`,
-      [entryId]
-    );
-  } catch {}
+  await port.linkRecentMentionsToEntry(entryId, 30);
 }

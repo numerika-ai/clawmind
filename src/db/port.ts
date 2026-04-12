@@ -57,6 +57,7 @@ export interface QueryEntriesOptions {
 
 export interface QueryFactsOptions {
   id?: number;
+  ids?: number[];
   topic?: string;
   status?: string;
   scope?: string;
@@ -245,6 +246,14 @@ export interface DatabasePort {
   getEntityRelations(entityId: number): Promise<any[]>;
   storeEntityMention(entityId: number, entryId?: number, factId?: number, contextSnippet?: string): Promise<number>;
   getEntityMentions(entityId: number, limit?: number): Promise<any[]>;
+
+  // === Entity Backfill Helpers ===
+  getFactIdsWithEntityMentions(): Promise<Set<number>>;
+  getEntryIdsWithEntityMentions(): Promise<Set<number>>;
+  countEntities(): Promise<number>;
+  countRelations(): Promise<number>;
+  linkRecentMentionsToFact(factId: number, windowSeconds?: number): Promise<void>;
+  linkRecentMentionsToEntry(entryId: number, windowSeconds?: number): Promise<void>;
 
   // === Memory Tiering ===
   getHotFacts(scope?: string): Promise<any[]>;

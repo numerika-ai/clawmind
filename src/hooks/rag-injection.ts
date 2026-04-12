@@ -397,20 +397,70 @@ async function semanticStrategy(port: DatabasePort, lanceManager: NativeLanceMan
 }
 
 // ============================================================================
-// Strategy 3: Graph traversal (entity-based)
+// Strategy 3: Graph traversal — 2-hop entity relations + linked facts
+//
+// Hop 0: prompt terms → searchEntities (max 3 entities)
+// Hop 1: entity → getEntityRelations (max 3 per entity)
+// Hop 2: relation target → getEntityMentions → linked facts via queryFacts
+//
+// Performance bound: 3 entities × 3 relations × 2 mention lookups = max 18 queries
 // ============================================================================
 async function graphStrategy(port: DatabasePort, cleanPrompt: string): Promise<RetrievalCandidate[]> {
   const results: RetrievalCandidate[] = [];
+  const seenEntityIds = new Set<number>();
+
   try {
     const words = cleanPrompt.match(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*|[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{4,}/g) || [];
     const terms = [...new Set(words)].slice(0, 5);
+
     for (const term of terms) {
-      const entities = await port.searchEntities(term, 2);
+      if (results.length >= 10) break;
+      const entities = await port.searchEntities(term, 3);
+
       for (const e of entities) {
+        if (seenEntityIds.has(e.id) || results.length >= 10) continue;
+        seenEntityIds.add(e.id);
+
+        // Hop 1: direct relations
         const rels = await port.getEntityRelations(e.id);
-        if (rels.length > 0) {
-          const relText = rels.slice(0, 3).map((r: any) => `${r.source_name} →[${r.relation_type}]→ ${r.target_name}`);
-          results.push({ id: `entity:${e.id}`, type: "entity", score: (e.sim ?? 0.5) * 0.8, strategy: "graph", text: `${e.name} (${e.entity_type}): ${relText.join("; ")}`, meta: { entityId: e.id } });
+        const topRels = rels.slice(0, 3);
+        const relTexts: string[] = [];
+        const linkedFactTexts: string[] = [];
+
+        for (const rel of topRels) {
+          relTexts.push(`${rel.source_name} →[${rel.relation_type}]→ ${rel.target_name}`);
+
+          // Hop 2: target entity mentions → linked facts
+          const targetId = rel.source_id === e.id ? rel.target_id : rel.source_id;
+          if (targetId && !seenEntityIds.has(targetId)) {
+            try {
+              const mentions = await port.getEntityMentions(targetId, 3);
+              const factIds = mentions
+                .filter((m: any) => m.fact_id != null)
+                .map((m: any) => m.fact_id as number);
+              if (factIds.length > 0) {
+                const facts = await port.queryFacts({ ids: factIds, limit: 3 });
+                for (const f of facts) {
+                  linkedFactTexts.push(`[${f.topic}] ${f.fact}`);
+                }
+              }
+            } catch { /* non-critical — continue traversal */ }
+          }
+        }
+
+        if (relTexts.length > 0 || linkedFactTexts.length > 0) {
+          let text = `${e.name} (${e.entity_type}): ${relTexts.join("; ")}`;
+          if (linkedFactTexts.length > 0) {
+            text += ` | linked facts: ${linkedFactTexts.join("; ")}`;
+          }
+          results.push({
+            id: `entity:${e.id}`,
+            type: "entity",
+            score: (e.sim ?? 0.5) * 0.85,
+            strategy: "graph",
+            text,
+            meta: { entityId: e.id, hops: linkedFactTexts.length > 0 ? 2 : 1 },
+          });
         }
       }
     }

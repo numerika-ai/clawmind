@@ -776,6 +776,10 @@ export class PostgresPort implements DatabasePort {
       clauses.push(`id = $${idx++}`);
       params.push(options.id);
     }
+    if (options.ids != null && options.ids.length > 0) {
+      clauses.push(`id = ANY($${idx++}::bigint[])`);
+      params.push(options.ids);
+    }
     if (options.topic != null) {
       clauses.push(`topic = $${idx++}`);
       params.push(options.topic);
@@ -2101,6 +2105,74 @@ export class PostgresPort implements DatabasePort {
       [entityId, limit]
     );
     return result.rows;
+  }
+
+  // ===========================================================================
+  // Entity Backfill Helpers (Phase C2)
+  // ===========================================================================
+
+  async getFactIdsWithEntityMentions(): Promise<Set<number>> {
+    try {
+      const result = await this.pool.query(
+        `SELECT DISTINCT fact_id FROM openclaw.agent_entity_mentions WHERE fact_id IS NOT NULL`
+      );
+      return new Set(result.rows.map((r: any) => r.fact_id));
+    } catch {
+      return new Set();
+    }
+  }
+
+  async getEntryIdsWithEntityMentions(): Promise<Set<number>> {
+    try {
+      const result = await this.pool.query(
+        `SELECT DISTINCT entry_id FROM openclaw.agent_entity_mentions WHERE entry_id IS NOT NULL`
+      );
+      return new Set(result.rows.map((r: any) => r.entry_id));
+    } catch {
+      return new Set();
+    }
+  }
+
+  async countEntities(): Promise<number> {
+    try {
+      const r = await this.pool.query(`SELECT COUNT(*)::int AS c FROM openclaw.agent_entities`);
+      return r.rows[0]?.c || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  async countRelations(): Promise<number> {
+    try {
+      const r = await this.pool.query(`SELECT COUNT(*)::int AS c FROM openclaw.agent_entity_relations`);
+      return r.rows[0]?.c || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  async linkRecentMentionsToFact(factId: number, windowSeconds = 30): Promise<void> {
+    try {
+      await this.pool.query(
+        `UPDATE openclaw.agent_entity_mentions
+         SET fact_id = $1
+         WHERE fact_id IS NULL AND entry_id IS NULL
+           AND created_at > NOW() - INTERVAL '1 second' * $2`,
+        [factId, windowSeconds]
+      );
+    } catch {}
+  }
+
+  async linkRecentMentionsToEntry(entryId: number, windowSeconds = 30): Promise<void> {
+    try {
+      await this.pool.query(
+        `UPDATE openclaw.agent_entity_mentions
+         SET entry_id = $1
+         WHERE fact_id IS NULL AND entry_id IS NULL
+           AND created_at > NOW() - INTERVAL '1 second' * $2`,
+        [entryId, windowSeconds]
+      );
+    } catch {}
   }
 
   // ===========================================================================

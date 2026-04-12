@@ -1066,6 +1066,17 @@ export class SqlitePort implements DatabasePort {
   }
 
   // =========================================================================
+  // Entity Backfill Helpers (SQLite stubs — entities are Postgres-only)
+  // =========================================================================
+
+  async getFactIdsWithEntityMentions(): Promise<Set<number>> { return new Set(); }
+  async getEntryIdsWithEntityMentions(): Promise<Set<number>> { return new Set(); }
+  async countEntities(): Promise<number> { return 0; }
+  async countRelations(): Promise<number> { return 0; }
+  async linkRecentMentionsToFact(_factId: number, _windowSeconds?: number): Promise<void> {}
+  async linkRecentMentionsToEntry(_entryId: number, _windowSeconds?: number): Promise<void> {}
+
+  // =========================================================================
   // Memory Tiering (SQLite stubs — tier/strength columns may not exist)
   // =========================================================================
 

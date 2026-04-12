@@ -221,6 +221,26 @@ export function createRagInjectionHook(deps: HookDependencies) {
         }
       } catch {}
 
+      // LEARNING OBSERVATIONS (from unified-memory collector → agent_learning)
+      // Reads proposed/accepted learnings and injects as guardrails.
+      try {
+        const learnings = await (port as any).pool?.query?.(
+          `SELECT learning_type, title, description
+           FROM openclaw.agent_learning
+           WHERE status IN ('proposed', 'accepted')
+           ORDER BY created_at DESC LIMIT 10`
+        );
+        if (learnings?.rows?.length > 0) {
+          for (const l of learnings.rows) {
+            if (l.learning_type === 'failure_analysis') {
+              guardrailLines.push(`[learned] ${l.title}: ${l.description?.slice(0, 150)}`);
+            } else {
+              slimLines.push(`[learned pattern] ${l.title}: ${l.description?.slice(0, 100)}`);
+            }
+          }
+        }
+      } catch {}
+
       // Conversations + trends
       try {
         const convs = await port.queryConversations({ status: 'active', recentHours: 24, minConfidence: 0.3, limit: 5 });

@@ -170,7 +170,7 @@ export interface DatabasePort {
   getFactStats(): Promise<FactStats>;
   updateFactAccessCount(factId: number): Promise<void>;
   incrementFactRepeatedCount(factId: number): Promise<void>;
-  getFactsForDecay(): Promise<any[]>;
+  getFactsForDecay(limit?: number): Promise<any[]>;
 
   // === Fact Vectors ===
   storeFactEmbedding(factId: number, embedding: number[]): Promise<void>;

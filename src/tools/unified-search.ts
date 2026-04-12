@@ -40,10 +40,13 @@ export function createUnifiedSearchTool(port: DatabasePort, lanceManager: Vector
         try {
           const vectorResults = await lanceManager.search(query, limit);
           vectorCount = vectorResults.length;
+          // Batch lookup — single query instead of N individual ones.
+          const entryIds = vectorResults.map(r => r.entryId);
+          const batchEntries = entryIds.length > 0 ? await port.queryEntries({ ids: entryIds }) : [];
+          const entryMap = new Map(batchEntries.map((e: any) => [e.id, e]));
           for (const r of vectorResults) {
             allHitIds.push(r.entryId);
-            const entries = await port.queryEntries({ ids: [r.entryId] });
-            const entry = entries[0];
+            const entry = entryMap.get(r.entryId);
             const text = entry?.summary || entry?.content?.slice(0, 120) || `entry#${r.entryId}`;
             const similarity = Math.max(0, Math.round((1 - (r.distance || 0)) * 100));
             vectorLines.push(`- [${similarity}%] [${entry?.entry_type || "?"}] ${text}`);

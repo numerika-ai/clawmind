@@ -16,6 +16,8 @@ import {
 import { extractFacts } from "../memory-bank/extractor";
 import { consolidateFact } from "../memory-bank/consolidator";
 import { extractAndLinkEntities } from "../entity/extractor";
+import { withRetry } from "../utils/retry";
+import { getCurrentSession, getSession, clearSession, clearDynamicToolPolicy } from "../utils/session-state";
 
 // State variables shared across hooks
 interface MemoryState {
@@ -37,6 +39,7 @@ interface HookDependencies {
   cfg: UnifiedMemoryConfig;
   memoryState: MemoryState;
   memoryBankConfig?: MemoryBankConfig;
+  inflight?: { track(promise: Promise<unknown>): void };
 }
 
 /**
@@ -60,7 +63,7 @@ const TOOL_LOG_WHITELIST = new Set([
  * Creates the tool call logging hook for after_tool_call
  */
 export function createToolCallLogHook(deps: HookDependencies) {
-  const { port, lanceManager, cfg, memoryState } = deps;
+  const { port, lanceManager, cfg, memoryState, inflight } = deps;
 
   // Resolve filter: config can override with "all", "none", or string[] of tool names
   const filterCfg = (cfg as any).logToolCallsFilter;
@@ -102,7 +105,7 @@ export function createToolCallLogHook(deps: HookDependencies) {
       const summary = `${toolName}(${status}): ${paramsPreview.slice(0, 80)}`;
       const hnswKey = `tool:${toolName}:${Date.now()}`;
 
-      const agentId = (event.agentId ?? event.agent_id ?? (globalThis as any).__openclawAgentId ?? extractAgentFromSessionKey(event.sessionKey as string | undefined) ?? "main") as string;
+      const agentId = (event.agentId ?? event.agent_id ?? getCurrentSession()?.agentId ?? extractAgentFromSessionKey(event.sessionKey as string | undefined) ?? "main") as string;
       const toolEntryId = await port.storeEntry({
         entryType: "tool",
         tags: tags.join(","),
@@ -112,9 +115,10 @@ export function createToolCallLogHook(deps: HookDependencies) {
         agentId,
       });
 
-      // Native HNSW indexing (fire and forget, don't block agent)
+      // Native HNSW indexing (tracked for graceful shutdown)
       if (lanceManager?.isReady()) {
-        lanceManager.addEntry(toolEntryId, summary).catch(() => {});
+        const p = lanceManager.addEntry(toolEntryId, summary).catch(() => {});
+        inflight?.track(p);
       }
     } catch (err) {
       // Silently skip — tool logging should never break the agent
@@ -127,13 +131,12 @@ export function createToolCallLogHook(deps: HookDependencies) {
  * Creates the agent end hook for agent_end
  */
 export function createAgentEndHook(deps: HookDependencies) {
-  const { port, cfg, memoryState, memoryBankConfig } = deps;
+  const { port, cfg, memoryState, memoryBankConfig, inflight } = deps;
 
   return async function(api: PluginApi, event: Record<string, unknown>) {
     // Always clear dynamic tool policy — prevent stale policies across turns
-    (globalThis as any).__openclawDynamicToolPolicy = undefined;
+    clearDynamicToolPolicy();
 
-    const gg = globalThis as any;
     const sessionKey = (event.sessionKey as string | undefined) ?? "unknown";
 
     try {
@@ -215,10 +218,10 @@ export function createAgentEndHook(deps: HookDependencies) {
         }
       }
 
-      // Resolve turnPrompt — prefer local memoryState, fall back to globalThis
-      // session-keyed map (set by rag-injection; survives cross-context plugin instances).
-      const turnPromptFromGlobal = gg.__openclawTurnPromptBySession?.[sessionKey];
-      const resolvedTurnPrompt = memoryState.turnPrompt || turnPromptFromGlobal || "";
+      // Resolve turnPrompt — prefer local memoryState, fall back to shared
+      // session-state module (set by rag-injection; survives cross-context instances).
+      const sessionState = getSession(sessionKey);
+      const resolvedTurnPrompt = memoryState.turnPrompt || sessionState?.turnPrompt || "";
 
       // ============================================================
       // CONVERSATION TRACKING (Phase 5)
@@ -326,7 +329,15 @@ export function createAgentEndHook(deps: HookDependencies) {
           if (!isCron && conversationText.length >= memoryBankConfig.minConversationLength) {
             const factScope = memoryState.agentId && memoryState.agentId !== "main" ? memoryState.agentId : "global";
 
-            extractFacts(conversationText, memoryBankConfig)
+            const extractionPromise = withRetry(
+              () => extractFacts(conversationText, memoryBankConfig),
+              {
+                retries: 1,
+                delayMs: 2000,
+                onRetry: (err, attempt) =>
+                  api.logger.warn?.(`memory-bank: extraction retry #${attempt}:`, String(err).slice(0, 100)),
+              },
+            )
               .then(async (facts) => {
                 for (const fact of facts) {
                   try {
@@ -338,7 +349,7 @@ export function createAgentEndHook(deps: HookDependencies) {
                 if (facts.length > 0) {
                   api.logger.info?.(`memory-bank: extracted ${facts.length} facts from conversation`);
                 }
-                // Entity extraction (v2.0 — fire and forget)
+                // Entity extraction (v2.0)
                 try {
                   await extractAndLinkEntities(conversationText, port, memoryBankConfig, api.logger);
                 } catch (entErr) {
@@ -348,6 +359,7 @@ export function createAgentEndHook(deps: HookDependencies) {
               .catch((exErr) => {
                 api.logger.warn?.("memory-bank: extraction error:", String(exErr).slice(0, 100));
               });
+            inflight?.track(extractionPromise);
           }
         } catch (mbErr) {
           api.logger.warn?.("memory-bank: memory bank error:", String(mbErr).slice(0, 100));
@@ -363,12 +375,7 @@ export function createAgentEndHook(deps: HookDependencies) {
       memoryState.matchedSkillId = null;
       memoryState.turnPrompt = null;
       memoryState.agentId = null;
-      (globalThis as any).__openclawAgentId = undefined;
-      (globalThis as any).__openclawSessionKey = undefined;
-      // Also clean the session-keyed turnPrompt map to avoid stale carry-over.
-      if (gg.__openclawTurnPromptBySession && sessionKey) {
-        delete gg.__openclawTurnPromptBySession[sessionKey];
-      }
+      clearSession(sessionKey);
     }
   };
 }

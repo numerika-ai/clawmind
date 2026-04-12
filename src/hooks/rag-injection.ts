@@ -6,6 +6,7 @@ import { embed } from "../embedding/nemotron";
 import { rerankResults, type RerankCandidate } from "../reranking/nemotron-rerank";
 import { extractAgentFromSessionKey } from "../utils/helpers";
 import { strengthenFact } from "../memory-bank/maintenance";
+import { setSession, setDynamicToolPolicy, clearDynamicToolPolicy } from "../utils/session-state";
 
 interface MemoryState {
   activeTrajectoryId: string | null;
@@ -66,27 +67,17 @@ export function createRagInjectionHook(deps: HookDependencies) {
 
     const agentId = (event.agentId ?? event.agent_id ?? extractAgentFromSessionKey(event.sessionKey as string | undefined) ?? "main") as string;
     memoryState.agentId = agentId;
-    (globalThis as any).__openclawAgentId = agentId;
-    (globalThis as any).__openclawSessionKey = event.sessionKey as string | undefined;
+    const sessionKey = (event.sessionKey as string | undefined) ?? "unknown";
 
-    // Always set turnPrompt so downstream on-turn-end hooks (conversation tracking,
-    // memory-bank fact extraction, pattern learning) can consume it.
-    //
-    // v2.0 regression: the assignment was moved inside the skill-match branch which
-    // silently disabled every write path when no skill matched.
-    //
-    // Second gotcha: the plugin initializes TWICE per gateway process (once via plugin
-    // loader for `[plugins]` context, once via embedded runner for `[gateway]` context).
-    // Each init creates its own `memoryState` closure. rag-injection fires in the
-    // `[plugins]` instance but agent_end fires in the `[gateway]` instance — they don't
-    // see each other's memoryState. We publish to a sessionKey-keyed globalThis map so
-    // on-turn-end in either context can read it (same pattern as __openclawAgentId).
+    // Publish turn state to shared session-state module (replaces globalThis
+    // pollution). Both plugin instances share the same module singleton via
+    // Node.js require() cache.
     const slicedPrompt = prompt.slice(0, 500);
     memoryState.turnPrompt = slicedPrompt;
-    const sessionKey = (event.sessionKey as string | undefined) ?? "unknown";
-    const gg = globalThis as any;
-    gg.__openclawTurnPromptBySession = gg.__openclawTurnPromptBySession ?? {};
-    gg.__openclawTurnPromptBySession[sessionKey] = slicedPrompt;
+    setSession(sessionKey, {
+      agentId,
+      turnPrompt: slicedPrompt,
+    });
 
     try {
       const slimLines: string[] = [];
@@ -327,13 +318,13 @@ export function createRagInjectionHook(deps: HookDependencies) {
           if (skill?.required_tools) {
             const tools: string[] = JSON.parse(skill.required_tools);
             if (tools.length > 0) {
-              (globalThis as any).__openclawDynamicToolPolicy = { allow: tools };
+              setDynamicToolPolicy({ allow: tools });
               api.logger.info?.(`memory-unified: TOOL ROUTING — skill "${memoryState.matchedSkillName}" → ${tools.length} tools`);
             }
           }
-        } catch { (globalThis as any).__openclawDynamicToolPolicy = undefined; }
+        } catch { clearDynamicToolPolicy(); }
       } else {
-        (globalThis as any).__openclawDynamicToolPolicy = undefined;
+        clearDynamicToolPolicy();
       }
 
       return { prependContext: contextBlock };

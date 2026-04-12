@@ -984,7 +984,7 @@ export class PostgresPort implements DatabasePort {
     );
   }
 
-  async getFactsForDecay(): Promise<any[]> {
+  async getFactsForDecay(limit = 1000): Promise<any[]> {
     const result = await this.pool.query(
       `SELECT k.id, k.confidence, k.last_accessed_at, k.created_at, k.ttl_days,
               t.ttl_days AS topic_ttl_days,
@@ -993,7 +993,10 @@ export class PostgresPort implements DatabasePort {
               COALESCE(k.strength, 1.0) AS strength
        FROM openclaw.agent_knowledge k
        LEFT JOIN openclaw.agent_memory_topics t ON k.topic = t.name
-       WHERE k.status = 'active' AND k.confidence > 0.3`
+       WHERE k.status = 'active' AND k.confidence > 0.3
+       ORDER BY k.last_accessed_at ASC NULLS FIRST
+       LIMIT $1`,
+      [limit]
     );
     return result.rows;
   }

@@ -7,6 +7,7 @@
 import { Type } from "@sinclair/typebox";
 import type { ToolDef, ToolResult } from "../types";
 import type { DatabasePort } from "../db/port";
+import { getCurrentSession } from "../utils/session-state";
 
 export function createFeedbackTool(port: DatabasePort): ToolDef {
   return {
@@ -58,8 +59,9 @@ async function rateFeedback(port: DatabasePort, params: Record<string, unknown>)
     return { content: [{ type: "text", text: "Error: 'rating' parameter required (-1, 0, or 1)" }] };
   }
 
-  const agentId = (params.agent_id as string) ?? (globalThis as any).__openclawAgentId ?? "main";
-  const sessionKey = (globalThis as any).__openclawSessionKey as string | undefined;
+  const currentSession = getCurrentSession();
+  const agentId = (params.agent_id as string) ?? currentSession?.agentId ?? "main";
+  const sessionKey = currentSession?.sessionKey;
 
   const id = await port.storeFeedback({
     agentId,

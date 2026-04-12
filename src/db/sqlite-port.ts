@@ -364,7 +364,7 @@ export class SqlitePort implements DatabasePort {
       .run(factId);
   }
 
-  async getFactsForDecay(): Promise<any[]> {
+  async getFactsForDecay(limit = 1000): Promise<any[]> {
     return this.udb.db
       .prepare(
         `SELECT f.id, f.confidence, f.last_accessed_at, f.created_at, f.ttl_days,
@@ -372,9 +372,11 @@ export class SqlitePort implements DatabasePort {
                 t.ttl_days AS topic_ttl_days
          FROM memory_facts f
          LEFT JOIN memory_topics t ON f.topic = t.name
-         WHERE f.status = 'active' AND f.confidence > 0.3`
+         WHERE f.status = 'active' AND f.confidence > 0.3
+         ORDER BY f.last_accessed_at ASC
+         LIMIT ?`
       )
-      .all();
+      .all(limit);
   }
 
   // =========================================================================

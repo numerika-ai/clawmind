@@ -11,6 +11,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+// Utilities
+import { InFlightTracker } from "./utils/inflight";
+
 // Config & types
 import { unifiedConfigSchema, type UnifiedMemoryConfig, type EntryType } from "./config";
 import type { PluginApi } from "./types";
@@ -92,10 +95,13 @@ class PortVectorManager {
 
       if (excludeTypes.length > 0) {
         const excludeSet = new Set(excludeTypes);
+        // Batch lookup — single query instead of N individual ones.
+        const allIds = results.map(r => r.entryId);
+        const allEntries = await this.port.queryEntries({ ids: allIds });
+        const entryMap = new Map(allEntries.map((e: any) => [e.id, e]));
         const filtered: Array<{ entryId: number; distance: number }> = [];
         for (const r of results) {
-          const entries = await this.port.queryEntries({ ids: [r.entryId] });
-          const entry = entries[0];
+          const entry = entryMap.get(r.entryId);
           if (entry && !excludeSet.has(entry.entry_type)) {
             filtered.push({ entryId: r.entryId, distance: r.distance });
             if (filtered.length >= topK) break;
@@ -164,6 +170,9 @@ const memoryUnifiedPlugin = {
       api.logger.error?.("memory-unified: config error:", err);
       throw err;
     }
+
+    // Shared in-flight promise tracker for graceful shutdown.
+    const inflight = new InFlightTracker();
 
     const resolvedDbPath = api.resolvePath(cfg.dbPath);
     (api as any)._resolvedDbPath = resolvedDbPath;
@@ -349,6 +358,7 @@ const memoryUnifiedPlugin = {
         lanceManager: vectorManager,
         cfg,
         memoryState,
+        inflight,
       });
 
       api.on("after_tool_call", async (event) => {
@@ -366,6 +376,7 @@ const memoryUnifiedPlugin = {
         cfg,
         memoryState,
         memoryBankConfig,
+        inflight,
       });
 
       api.on("agent_end", async (event) => {
@@ -481,17 +492,23 @@ const memoryUnifiedPlugin = {
             api.logger.warn?.("memory-unified: fact backfill failed:", String(err))
           );
           // v2.0: Entity backfill — extract entities from existing facts & entries
-          import("./entity/backfill").then(({ backfillEntitiesFromFacts, backfillEntitiesFromEntries }) => {
-            backfillEntitiesFromFacts(port, memoryBankConfig, api.logger)
-              .then(() => backfillEntitiesFromEntries(port, memoryBankConfig, api.logger))
-              .catch(err => api.logger.warn?.("memory-unified: entity backfill failed:", String(err)));
-          }).catch(() => {});
+          const backfillPromise = import("./entity/backfill").then(({ backfillEntitiesFromFacts, backfillEntitiesFromEntries }) => {
+            return backfillEntitiesFromFacts(port, memoryBankConfig, api.logger)
+              .then(() => backfillEntitiesFromEntries(port, memoryBankConfig, api.logger));
+          }).catch(err => api.logger.warn?.("memory-unified: entity backfill failed:", String(err)));
+          inflight.track(backfillPromise);
         }
       },
       stop: () => {
         vectorManager.save();
-        port.close().catch(() => {});
-        api.logger.info?.("memory-unified: service stopped");
+        // Await in-flight promises (extraction, backfill, lance indexing)
+        // before closing the database connection. Async internally — the
+        // openclaw service.stop contract is sync but we fire the drain and
+        // let Node.js process exit grace period complete it.
+        inflight.drain(5000)
+          .then(() => port.close())
+          .catch(() => port.close().catch(() => {}))
+          .finally(() => api.logger.info?.("memory-unified: service stopped"));
       },
     });
   },

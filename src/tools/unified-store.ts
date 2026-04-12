@@ -4,6 +4,7 @@ import type { ToolDef, ToolResult } from "../types";
 import type { DatabasePort } from "../db/port";
 import type { EntryType } from "../config";
 import { autoTag, summarize, extractAgentFromSessionKey } from "../utils/helpers";
+import { getCurrentSession } from "../utils/session-state";
 
 interface NativeHnswManager {
   isReady(): boolean;
@@ -30,7 +31,8 @@ export function createUnifiedStoreTool(
       const entryType = (params.type as EntryType) ?? "history";
       const userTags = params.tags as string | undefined;
       const sourcePath = params.source_path as string | undefined;
-      const agentId = (params.agent_id as string | undefined) ?? (globalThis as any).__openclawAgentId ?? extractAgentFromSessionKey((globalThis as any).__openclawSessionKey) ?? "main";
+      const currentSession = getCurrentSession();
+      const agentId = (params.agent_id as string | undefined) ?? currentSession?.agentId ?? extractAgentFromSessionKey(currentSession?.sessionKey) ?? "main";
 
       const tags = userTags ? userTags.split(",").map(t => t.trim()) : autoTag(content);
       const summary = summarize(content);

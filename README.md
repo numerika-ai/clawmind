@@ -322,9 +322,34 @@ npm run watch    # Watch mode (if configured)
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture overview
 - [MEMORY-BANK-SPEC.md](MEMORY-BANK-SPEC.md) — Memory Bank specification
 
+## Recent Upgrades (2026-04-12)
+
+### Performance
+- **N+1 vector search fix** — batch `queryEntries` in PortVectorManager.search + unified-search tool (2-3x faster)
+- **Bounded getFactsForDecay** — LIMIT 1000 + ORDER BY last_accessed ASC (prevents OOM at scale)
+
+### Data Safety
+- **Graceful shutdown flush** — `InFlightTracker` utility tracks background promises (extraction, backfill, lance indexing); `stop()` awaits drain with 5s timeout before closing db
+- **Extraction retry** — `withRetry` utility for transient errors (ECONNREFUSED, ETIMEDOUT, HTTP 429/502/503/504) with 1 retry + 2s delay
+
+### Architecture
+- **Session state module** — replaces 6x `globalThis.__openclaw*` pollution with clean `Map<sessionKey, SessionState>` singleton shared across dual plugin instances
+- **DatabasePort entity methods** — 6 new methods (`getFactIdsWithEntityMentions`, `countEntities`, `linkRecentMentionsToFact`, etc.) replacing `(port as any).pool.query(...)` in backfill.ts
+- **Dead code cleanup** — removed unused `VectorManager` class (184 LOC)
+
+### Features
+- **2-hop entity graph RAG** — graphStrategy upgraded from single-hop (entity → relations → text) to 2-hop with linked facts (entity → relations → target mentions → queryFacts). With 434 entities + 552 relations + 1177 mentions, produces significantly richer context.
+
+### Data
+- **agent_entities**: 434 rows
+- **agent_entity_relations**: 552 rows
+- **agent_entity_mentions**: 1177 rows
+- **agent_entries**: 809 rows
+- **agent_knowledge**: 194 facts
+
 ## License
 
 MIT
 
 ---
-*Last updated: 2026-03-28*
+*Last updated: 2026-04-12*
